@@ -3,7 +3,6 @@ Yet Another Universal Model
 
 # Hamiltonian LLM Trainer
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-lightgrey.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
 **Explore Language Model Training Through the Lens of Classical Mechanics**
@@ -71,7 +70,7 @@ This project provides a framework and application for training Language Models (
 
 This project is dual-licensed:
 
-*   **PolyForm Noncommercial License 1.0.0:** You may use this software for non-commercial purposes. See [LICENSE_POLYFORM_NC_1.0.0.txt](LICENSE_POLYFORM_NC_1.0.0.txt).
+*   **PolyForm Noncommercial License 1.0.0:** You may use this software for non-commercial purposes. See [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
 *   **Commercial use requires separate licensing** 
 
 You may choose which license applies to your specific use case. Contributions are accepted under the Apache License 2.0.
