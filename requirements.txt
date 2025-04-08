@@ -1,0 +1,5 @@
+torch>=1.13.0 # Or a specific version compatible with your system/CUDA
+numpy>=1.21.0
+gradio>=3.40.0 # Use a recent version
+matplotlib>=3.5.0
+# Add other specific libraries if needed later (e.g., transformers, sentencepiece for subwords)
