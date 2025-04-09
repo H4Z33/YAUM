@@ -26,8 +26,8 @@ This project provides a framework and application for training Language Models (
 
 1.  **Clone the repository:**
     ```bash
-    git clone github.com/H4Z33/YAUM
-    cd YAUM
+    git clone https://github.com/your-username/hamiltonian-llm-trainer.git
+    cd hamiltonian-llm-trainer
     ```
 2.  **Create a virtual environment (recommended):**
     ```bash
@@ -45,7 +45,7 @@ This project provides a framework and application for training Language Models (
 1.  **Ensure dependencies are installed.**
 2.  **Run the Gradio application:**
     ```bash
-    python -m ui.app
+    python -m yaum.ui.app
     ```
 3.  **Open your web browser** to the local URL provided (usually `http://127.0.0.1:7860`).
 
