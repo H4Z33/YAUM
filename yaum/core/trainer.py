@@ -45,7 +45,10 @@ class Trainer:
         self.idx_to_char = None
         self.vocab_size = None
 
-        self.integrator = make_integrator(config.get("integrator", "leapfrog"))
+        self.integrator = make_integrator(
+            config.get("integrator", "leapfrog"),
+            **config.get("integrator_params", {}),
+        )
         self.adaptive = self._build_adaptive_controller(config)
 
         self.current_step = 0
@@ -421,7 +424,10 @@ class Trainer:
             self.vocab_size = checkpoint["vocab_size"]
             self.char_to_idx = checkpoint["char_to_idx"]
             self.idx_to_char = checkpoint["idx_to_char"]
-            self.integrator = make_integrator(self.config.get("integrator", "leapfrog"))
+            self.integrator = make_integrator(
+                self.config.get("integrator", "leapfrog"),
+                **self.config.get("integrator_params", {}),
+            )
 
             self.model = RNNCharModel(
                 vocab_size=self.vocab_size,

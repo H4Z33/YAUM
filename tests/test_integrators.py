@@ -13,6 +13,7 @@ import torch
 
 from yaum.core.integrators import (
     INTEGRATORS,
+    LangevinIntegrator,
     LeapfrogIntegrator,
     YoshidaIntegrator,
     make_integrator,
@@ -125,6 +126,90 @@ def test_yoshida_is_higher_order_than_leapfrog():
     e_yosh = err(yosh, 0.05)
 
     assert e_yosh < e_leap * 1e-2
+
+
+def test_langevin_zero_friction_matches_core():
+    torch.manual_seed(0)
+    mass = torch.ones(1, 1)
+    x = torch.tensor([[1.0]]).requires_grad_(True)
+    p = torch.tensor([[0.0]])
+    force_fn = harmonic_force(1.0)
+
+    leap = LeapfrogIntegrator().step(x, p, 0.02, force_fn, mass, retain_final=False)
+    thermo = LangevinIntegrator(friction=0.0, temperature=5.0).step(
+        x, p, 0.02, force_fn, mass, retain_final=False
+    )
+    assert torch.allclose(thermo.E, leap.E)
+    assert torch.allclose(thermo.P, leap.P)
+
+
+def test_langevin_zero_temperature_damps_momentum():
+    torch.manual_seed(0)
+    mass = torch.ones(1, 1)
+    x = torch.tensor([[0.0]]).requires_grad_(True)
+    p = torch.tensor([[2.0]])
+    integrator = LangevinIntegrator(friction=1.0, temperature=0.0)
+    force_fn = harmonic_force(1.0)
+
+    for _ in range(500):
+        step = integrator.step(x, p, 0.05, force_fn, mass, retain_final=False)
+        x = step.E.requires_grad_(True)
+        p = step.P
+    assert abs(float(p)) < 1e-3
+
+
+def test_langevin_equipartition_reaches_target_temperature():
+    """Mean kinetic energy should approach kT / 2 per degree of freedom."""
+    torch.manual_seed(42)
+    kT = 2.5
+    mass = torch.ones(1, 1)
+    integrator = LangevinIntegrator(friction=1.0, temperature=kT, core="leapfrog")
+    force_fn = harmonic_force(1.0)
+
+    x = torch.tensor([[0.0]]).requires_grad_(True)
+    p = torch.tensor([[0.0]])
+
+    p_sq_samples = []
+    dt = 0.05
+    burn_in = 2000
+    collect = 8000
+    for k in range(burn_in + collect):
+        step = integrator.step(x, p, dt, force_fn, mass, retain_final=False)
+        x = step.E.requires_grad_(True)
+        p = step.P
+        if k >= burn_in:
+            p_sq_samples.append(float(p) ** 2)
+
+    mean_p_sq = sum(p_sq_samples) / len(p_sq_samples)
+    # <p^2 / m> = kT for a single d.o.f. with unit mass.
+    assert abs(mean_p_sq - kT) / kT < 0.1
+
+
+def test_make_integrator_forwards_kwargs_to_langevin():
+    integrator = make_integrator(
+        "langevin",
+        friction=0.7,
+        temperature=1.3,
+        core="yoshida4",
+    )
+    assert isinstance(integrator, LangevinIntegrator)
+    assert integrator.gamma == 0.7
+    assert integrator.kT == 1.3
+    assert integrator.core.name == "yoshida4"
+
+
+def test_make_integrator_drops_unknown_kwargs():
+    integrator = make_integrator("leapfrog", friction=99.0, something_random=123)
+    assert isinstance(integrator, LeapfrogIntegrator)
+
+
+def test_langevin_rejects_invalid_parameters():
+    with pytest.raises(ValueError):
+        LangevinIntegrator(friction=-1.0)
+    with pytest.raises(ValueError):
+        LangevinIntegrator(temperature=-0.1)
+    with pytest.raises(ValueError):
+        LangevinIntegrator(core="nope")
 
 
 def test_phase_step_carries_loss_and_eval_count():

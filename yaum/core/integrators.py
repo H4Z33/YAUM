@@ -10,8 +10,10 @@ kicks around a drift. Turtles all the way down.
 """
 from __future__ import annotations
 
+import inspect
+import math
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Union
 
 import torch
 
@@ -122,16 +124,95 @@ class YoshidaIntegrator(SymplecticIntegrator):
         )
 
 
-INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
+class LangevinIntegrator(SymplecticIntegrator):
+    """OBABO-split Langevin dynamics (Leimkuhler & Matthews, 2013).
+
+    A deterministic symplectic core is flanked by two Ornstein–Uhlenbeck
+    half-steps that exchange momentum with a heat bath at temperature
+    ``kT`` with friction ``gamma``. The resulting flow samples the
+    canonical ensemble, trading strict energy conservation for the
+    ability to explore ``(E, P)`` configurations at a fixed temperature.
+
+    The core defaults to leapfrog but accepts any other
+    :class:`SymplecticIntegrator` — passing ``"yoshida4"`` gives
+    fourth-order deterministic accuracy inside the thermostat.
+    """
+
+    name = "langevin"
+    order = 2
+
+    def __init__(
+        self,
+        friction: float = 1.0,
+        temperature: float = 1.0,
+        core: Union[str, "SymplecticIntegrator"] = "leapfrog",
+    ):
+        if friction < 0:
+            raise ValueError("friction must be >= 0")
+        if temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        self.gamma = float(friction)
+        self.kT = float(temperature)
+        if isinstance(core, str):
+            if core not in _CORE_INTEGRATORS:
+                raise ValueError(
+                    f"Unknown core integrator {core!r}. "
+                    f"Available: {sorted(_CORE_INTEGRATORS)}"
+                )
+            self.core = _CORE_INTEGRATORS[core]()
+        else:
+            self.core = core
+
+    def _ou_half(self, P: torch.Tensor, half_dt: float, mass: torch.Tensor) -> torch.Tensor:
+        if self.gamma == 0.0:
+            return P
+        c = math.exp(-self.gamma * half_dt)
+        variance = mass * self.kT * (1.0 - c * c)
+        sigma = torch.sqrt(torch.clamp(variance, min=0.0))
+        noise = torch.randn_like(P)
+        return c * P + sigma * noise
+
+    def step(self, E, P, dt, force_fn, mass, retain_final=True):
+        P_in = self._ou_half(P, dt * 0.5, mass)
+        inner = self.core.step(E, P_in, dt, force_fn, mass, retain_final=retain_final)
+        P_out = self._ou_half(inner.P, dt * 0.5, mass)
+        return PhaseStep(
+            E=inner.E,
+            P=P_out,
+            loss_initial=inner.loss_initial,
+            loss_final=inner.loss_final,
+            n_force_evals=inner.n_force_evals,
+        )
+
+
+_CORE_INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
     LeapfrogIntegrator.name: LeapfrogIntegrator,
     YoshidaIntegrator.name: YoshidaIntegrator,
 }
 
+INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
+    **_CORE_INTEGRATORS,
+    LangevinIntegrator.name: LangevinIntegrator,
+}
 
-def make_integrator(name: str) -> SymplecticIntegrator:
+
+def make_integrator(name: str, **params) -> SymplecticIntegrator:
+    """Instantiate an integrator by name, forwarding any parameters it accepts.
+
+    Unknown keyword arguments are silently dropped so callers can pass a
+    loose config dict without having to know which integrator they are
+    constructing.
+    """
     try:
-        return INTEGRATORS[name]()
+        cls = INTEGRATORS[name]
     except KeyError as err:
         raise ValueError(
             f"Unknown integrator {name!r}. Available: {sorted(INTEGRATORS)}"
         ) from err
+    signature = inspect.signature(cls.__init__)
+    accepted = {
+        key: value
+        for key, value in params.items()
+        if key in signature.parameters
+    }
+    return cls(**accepted)
