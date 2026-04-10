@@ -27,6 +27,7 @@ from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
 from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
 from .integrators import make_integrator
+from .geometry import FisherMassConfig, FisherMassEstimator, fisher_diagonal_sample
 from .observables import ObservableWindow, snapshot
 from .utils import device, get_batch
 
@@ -75,6 +76,8 @@ class Trainer:
         self._observables = ObservableWindow(
             size=int(config.get("observable_window", 32))
         )
+        self._fisher: FisherMassEstimator | None = None
+        self._fisher_cfg: FisherMassConfig | None = None
 
         self.run_id = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
 
@@ -139,6 +142,30 @@ class Trainer:
             f"| integrator: {self.integrator.name} (order {self.integrator.order})"
         )
 
+        if self.config.get("mass_mode") == "fisher":
+            self._fisher_cfg = FisherMassConfig(
+                beta=float(self.config.get("fisher_beta", 0.9)),
+                eps=float(self.config.get("fisher_eps", 1e-3)),
+                refresh_every=int(self.config.get("fisher_refresh_every", 50)),
+                batches_per_refresh=int(
+                    self.config.get("fisher_batches_per_refresh", 4)
+                ),
+            )
+            self._fisher = FisherMassEstimator(
+                shape=(self.vocab_size, self.config["embedding_dim"]),
+                config=self._fisher_cfg,
+            )
+            self._fisher.initialise(device, self.E.dtype)
+            self.mass_vector = self._fisher.current()
+            print(
+                f"Fisher mass: eps={self._fisher_cfg.eps} "
+                f"beta={self._fisher_cfg.beta} "
+                f"refresh_every={self._fisher_cfg.refresh_every}"
+            )
+        else:
+            self._fisher = None
+            self._fisher_cfg = None
+
         self.current_step = 0
         self._stop_training_flag = False
         self._energy_reference = None
@@ -147,6 +174,35 @@ class Trainer:
             self.adaptive.dt = self._current_dt
         self._observables.clear()
         print("Trainer setup complete.")
+
+    def _refresh_fisher_mass(self) -> None:
+        """Blend a fresh diagonal empirical Fisher into the mass estimator."""
+        if self._fisher is None or self._fisher_cfg is None:
+            return
+        cfg = self._fisher_cfg
+        accum = torch.zeros_like(self.E)
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for _ in range(cfg.batches_per_refresh):
+                try:
+                    x, y = get_batch(
+                        self.train_data,
+                        self.config["context_window"],
+                        self.config["batch_size"],
+                        device,
+                    )
+                except ValueError:
+                    break
+                accum += fisher_diagonal_sample(
+                    self.model, self.criterion, self.E, x, y
+                )
+            accum /= max(cfg.batches_per_refresh, 1)
+            self._fisher.update(accum)
+            self.mass_vector = self._fisher.current()
+        finally:
+            if was_training:
+                self.model.train()
 
     def _run_reversibility_probe(self, x_batch, y_batch) -> float:
         """Integrate forward/backward on the current batch and return residual."""
@@ -200,6 +256,9 @@ class Trainer:
         self.model.train()
         self.E.requires_grad_(True)
 
+        if self._fisher is not None and self._fisher.update_count == 0:
+            self._refresh_fisher_mass()
+
         print(f"Starting training from step {self.current_step}...")
 
         for step in range(self.current_step, self.config["num_steps"]):
@@ -207,6 +266,14 @@ class Trainer:
                 print(f"Training stopped externally at step {step}.")
                 yield {"status": "stopped", "step": step}
                 break
+
+            if (
+                self._fisher is not None
+                and self._fisher_cfg is not None
+                and step > self.current_step
+                and (step - self.current_step) % self._fisher_cfg.refresh_every == 0
+            ):
+                self._refresh_fisher_mass()
 
             x_batch, y_batch = get_batch(
                 self.train_data,
@@ -482,6 +549,23 @@ class Trainer:
             self.P = checkpoint["P"].to(device)
             if "mass_vector" in checkpoint and checkpoint["mass_vector"] is not None:
                 self.mass_vector = checkpoint["mass_vector"].to(device)
+            if self.config.get("mass_mode") == "fisher":
+                self._fisher_cfg = FisherMassConfig(
+                    beta=float(self.config.get("fisher_beta", 0.9)),
+                    eps=float(self.config.get("fisher_eps", 1e-3)),
+                    refresh_every=int(self.config.get("fisher_refresh_every", 50)),
+                    batches_per_refresh=int(
+                        self.config.get("fisher_batches_per_refresh", 4)
+                    ),
+                )
+                self._fisher = FisherMassEstimator(
+                    shape=tuple(self.mass_vector.shape),
+                    config=self._fisher_cfg,
+                )
+                self._fisher.mass = self.mass_vector
+            else:
+                self._fisher = None
+                self._fisher_cfg = None
             self.optimizer_W.load_state_dict(checkpoint["optimizer_W_state_dict"])
             self.current_step = checkpoint["step"]
             self.train_losses_l1 = checkpoint["train_losses_l1"]

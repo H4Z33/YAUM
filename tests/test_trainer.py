@@ -217,6 +217,43 @@ def test_phase_transition_observables_populate_history(tmp_path):
     assert any(v == v for v in history["susceptibility"])
 
 
+def test_trainer_runs_with_fisher_mass(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=4)
+    config["mass_mode"] = "fisher"
+    config["fisher_refresh_every"] = 2
+    config["fisher_batches_per_refresh"] = 2
+    config["fisher_eps"] = 1e-12  # keep the floor out of the way for the test
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    events = list(trainer.train())
+    assert events[-1]["status"] == "finished"
+    assert trainer._fisher is not None
+    assert trainer._fisher.update_count >= 1
+    # Fisher mass has the full embedding shape, not the (V, 1) scalar default.
+    assert trainer.mass_vector.shape == (8, 4)
+    # At least one entry should have moved away from the pure-eps floor.
+    assert (trainer.mass_vector > 1e-12).any()
+
+
+def test_fisher_mass_survives_checkpoint_round_trip(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=4)
+    config["mass_mode"] = "fisher"
+    config["fisher_refresh_every"] = 2
+    config["fisher_batches_per_refresh"] = 2
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    list(trainer.train())
+    ckpt_path = os.path.join(trainer.save_dir, "checkpoint_latest.pt")
+
+    reloaded = Trainer(_tiny_config(tmp_path))
+    assert reloaded.load_checkpoint(ckpt_path)
+    assert reloaded._fisher is not None
+    assert torch.allclose(reloaded.mass_vector, trainer.mass_vector)
+    assert reloaded._fisher.current().shape == (8, 4)
+
+
 def test_adaptive_dt_controller_wires_in_and_records_dt(tmp_path):
     torch.manual_seed(0)
     config = _tiny_config(tmp_path, num_steps=4)
