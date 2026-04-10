@@ -22,6 +22,7 @@ import torch.optim as optim
 
 from ..data.handling import save_vocab  # noqa: F401 - re-exported for callers
 from ..models.rnn import RNNCharModel
+from .adaptive import AdaptiveStepController
 from .dynamics import make_rnn_force_fn, total_hamiltonian
 from .integrators import make_integrator
 from .utils import device, get_batch
@@ -44,6 +45,7 @@ class Trainer:
         self.vocab_size = None
 
         self.integrator = make_integrator(config.get("integrator", "leapfrog"))
+        self.adaptive = self._build_adaptive_controller(config)
 
         self.current_step = 0
         self.train_losses_l1: list[float] = []
@@ -54,14 +56,33 @@ class Trainer:
             "force_E": [],
             "P_norm": [],
             "H_drift": [],
+            "dt": [],
         }
         self._energy_reference = None
+        self._current_dt: float = float(config["dt"]) if "dt" in config else 0.01
 
         self.run_id = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+
         self.save_dir = os.path.join(config.get("results_dir", "results"), self.run_id)
         os.makedirs(self.save_dir, exist_ok=True)
 
         self._stop_training_flag = False
+
+    @staticmethod
+    def _build_adaptive_controller(config) -> AdaptiveStepController | None:
+        if not config.get("adaptive_dt"):
+            return None
+        dt = float(config.get("dt", 0.01))
+        return AdaptiveStepController(
+            dt_init=dt,
+            dt_min=float(config.get("dt_min", dt * 1e-2)),
+            dt_max=float(config.get("dt_max", dt * 1e2)),
+            drift_high=float(config.get("drift_high", 1e-2)),
+            drift_low=float(config.get("drift_low", 1e-5)),
+            shrink=float(config.get("dt_shrink", 0.5)),
+            grow=float(config.get("dt_grow", 1.2)),
+            grow_after=int(config.get("dt_grow_after", 10)),
+        )
 
     def setup(
         self,
@@ -111,6 +132,9 @@ class Trainer:
         self.current_step = 0
         self._stop_training_flag = False
         self._energy_reference = None
+        self._current_dt = float(self.config["dt"])
+        if self.adaptive is not None:
+            self.adaptive.dt = self._current_dt
         print("Trainer setup complete.")
 
     def _step_embeddings(self, x_batch, y_batch):
@@ -119,7 +143,7 @@ class Trainer:
         step = self.integrator.step(
             self.E,
             self.P,
-            self.config["dt"],
+            self._current_dt,
             force_fn,
             self.mass_vector,
             retain_final=True,
@@ -164,7 +188,7 @@ class Trainer:
                 break
 
             with torch.no_grad():
-                dt = self.config["dt"]
+                dt = self._current_dt
                 force_eff_norm = (
                     torch.linalg.norm((P_new - self.P) / dt).item() if dt else 0.0
                 )
@@ -203,6 +227,9 @@ class Trainer:
                 self._energy_reference = energy
             h_drift = energy.drift(self._energy_reference)
 
+            if self.adaptive is not None:
+                self._current_dt = self.adaptive.observe(h_drift)
+
             eval_every = self.config["eval_interval"]
             is_eval_step = (
                 self.current_step % eval_every == 0
@@ -221,13 +248,14 @@ class Trainer:
             self.debug_stats["force_E"].append(force_eff_norm)
             self.debug_stats["P_norm"].append(p_norm)
             self.debug_stats["H_drift"].append(h_drift)
+            self.debug_stats["dt"].append(self._current_dt)
 
             elapsed = time.time() - start_time
             log_message = (
                 f"Step {self.current_step}/{self.config['num_steps']} | T: {elapsed:.1f}s "
                 f"| L1: {loss_l1.item():.4f} | L2->W: {loss_l2.item():.4f} | Test L: {test_loss:.4f} "
                 f"| ||∇W||: {total_norm_W_before:.3f} | ||F_E||: {force_eff_norm:.3f} "
-                f"| ||P||: {p_norm:.3f} | ΔH/H: {h_drift:.3e}"
+                f"| ||P||: {p_norm:.3f} | ΔH/H: {h_drift:.3e} | dt: {self._current_dt:.3e}"
             )
             print(log_message)
 
@@ -242,6 +270,7 @@ class Trainer:
                 "force_E_norm": force_eff_norm,
                 "P_norm": p_norm,
                 "H_drift": h_drift,
+                "dt": self._current_dt,
                 "log_message": log_message,
                 "history": self.get_history(),
             }
@@ -373,9 +402,16 @@ class Trainer:
             self.train_losses_l2 = checkpoint["train_losses_l2"]
             self.test_losses = checkpoint["test_losses"]
             loaded_debug = checkpoint["debug_stats"]
-            # Back-compat: older checkpoints had no H_drift column.
+            # Back-compat: older checkpoints had no H_drift or dt columns.
             loaded_debug.setdefault("H_drift", [0.0] * len(self.test_losses))
+            loaded_debug.setdefault(
+                "dt", [float(self.config.get("dt", 0.01))] * len(self.test_losses)
+            )
             self.debug_stats = loaded_debug
+            self.adaptive = self._build_adaptive_controller(self.config)
+            self._current_dt = float(self.config["dt"])
+            if self.adaptive is not None:
+                self.adaptive.dt = self._current_dt
             self.save_dir = os.path.dirname(filepath)
             self._energy_reference = None
 
@@ -405,6 +441,7 @@ class Trainer:
             "force_E": self.debug_stats["force_E"],
             "P_norm": self.debug_stats["P_norm"],
             "H_drift": self.debug_stats.get("H_drift", []),
+            "dt": self.debug_stats.get("dt", []),
         }
 
     def generate(self, start_prompt, length, temperature):

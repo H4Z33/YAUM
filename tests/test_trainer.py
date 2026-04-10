@@ -117,3 +117,33 @@ def test_trainer_accepts_configured_integrator(tmp_path, name):
     events = list(trainer.train())
     assert events[-1]["status"] == "finished"
     assert trainer.integrator.name == name
+
+
+def test_adaptive_dt_off_by_default(tmp_path):
+    trainer = Trainer(_tiny_config(tmp_path))
+    assert trainer.adaptive is None
+
+
+def test_adaptive_dt_controller_wires_in_and_records_dt(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=4)
+    config.update(
+        adaptive_dt=True,
+        dt_min=1e-5,
+        dt_max=1.0,
+        drift_high=1e-6,   # force shrinks
+        drift_low=-1.0,    # never grow
+        dt_shrink=0.5,
+        dt_grow=2.0,
+        dt_grow_after=100,
+    )
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    start_dt = trainer._current_dt
+    list(trainer.train())
+    assert trainer.adaptive is not None
+    assert trainer.adaptive.stats["shrinks"] >= 1
+    assert trainer._current_dt < start_dt
+    history = trainer.get_history()
+    assert "dt" in history
+    assert len(history["dt"]) == len(history["test_l"])
