@@ -25,6 +25,7 @@ from ..models import make_model
 from .adaptive import AdaptiveStepController
 from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
+from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
 from .integrators import make_integrator
 from .utils import device, get_batch
 
@@ -388,13 +389,19 @@ class Trainer:
             print("Warning: Cannot save checkpoint, trainer not fully initialized.")
             return
 
+        E_cpu = self.E.detach().cpu()
+        P_cpu = self.P.detach().cpu()
+        mass_cpu = self.mass_vector.detach().cpu()
+        integrity = compute_integrity(E_cpu, P_cpu, mass_cpu)
         state = {
             "step": self.current_step,
             "config": self.config,
             "vocab_size": self.vocab_size,
             "model_state_dict": self.model.state_dict(),
-            "E": self.E.detach().cpu(),
-            "P": self.P.detach().cpu(),
+            "E": E_cpu,
+            "P": P_cpu,
+            "mass_vector": mass_cpu,
+            "integrity": integrity.to_dict(),
             "optimizer_W_state_dict": self.optimizer_W.state_dict(),
             "train_losses_l1": self.train_losses_l1,
             "train_losses_l2": self.train_losses_l2,
@@ -415,6 +422,23 @@ class Trainer:
             checkpoint = torch.load(filepath, map_location=device)
             print(f"Loading checkpoint from {filepath}...")
 
+            saved_fp = checkpoint.get("integrity")
+            if saved_fp is not None:
+                mass_cpu = checkpoint.get("mass_vector")
+                if mass_cpu is None:
+                    print("Checkpoint has integrity fingerprint but no mass_vector; refusing.")
+                    return False
+                fresh = compute_integrity(
+                    checkpoint["E"], checkpoint["P"], mass_cpu
+                )
+                report = verify_integrity(
+                    CheckpointIntegrity.from_dict(saved_fp), fresh
+                )
+                if not report.ok:
+                    print(report.format())
+                    return False
+                print(report.format())
+
             self.config = checkpoint["config"]
             self.vocab_size = checkpoint["vocab_size"]
             self.char_to_idx = checkpoint["char_to_idx"]
@@ -432,6 +456,8 @@ class Trainer:
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.E = checkpoint["E"].to(device).requires_grad_(True)
             self.P = checkpoint["P"].to(device)
+            if "mass_vector" in checkpoint and checkpoint["mass_vector"] is not None:
+                self.mass_vector = checkpoint["mass_vector"].to(device)
             self.optimizer_W.load_state_dict(checkpoint["optimizer_W_state_dict"])
             self.current_step = checkpoint["step"]
             self.train_losses_l1 = checkpoint["train_losses_l1"]
