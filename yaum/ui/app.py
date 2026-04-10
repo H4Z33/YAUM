@@ -146,105 +146,122 @@ def update_status(text):
     # This function is called by button clicks, return value updates status textbox
     return str(text)
 
+def _filter_valid_pairs(steps, values):
+    """Return aligned (step, value) pairs stripped of NaN/Inf."""
+    if not values:
+        return [], []
+    out_s, out_v = [], []
+    for s, v in zip(steps, values):
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(fv):
+            continue
+        out_s.append(s)
+        out_v.append(fv)
+    return out_s, out_v
+
+
+def _panel_loss(ax, history, steps):
+    s_l1, v_l1 = _filter_valid_pairs(steps, history.get('train_l1', []))
+    s_l2, v_l2 = _filter_valid_pairs(steps, history.get('train_l2', []))
+    s_te, v_te = _filter_valid_pairs(steps, history.get('test_l', []))
+    if not v_te:
+        return False
+    if v_l1: ax.plot(s_l1, v_l1, label='L1', alpha=0.7, linewidth=1)
+    if v_l2: ax.plot(s_l2, v_l2, label='L2->W', alpha=0.7, linewidth=1)
+    ax.plot(s_te, v_te, label='Test', linewidth=1.5, color='red')
+    lo, hi = min(v_te) * 0.9, min(max(v_te) * 1.1, min(v_te) * 20)
+    ax.set_ylim(bottom=lo, top=hi)
+    ax.set_ylabel('Loss', fontsize=9)
+    return True
+
+
+def _panel_positive_line(ax, history, steps, key, label):
+    s, v = _filter_valid_pairs(steps, history.get(key, []))
+    if not v:
+        return False
+    ax.plot(s, v, label=label, linewidth=1)
+    ax.set_ylim(bottom=0, top=max(v) * 1.1 if max(v) > 0 else 1.0)
+    return True
+
+
+def _panel_h_drift(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('H_drift', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='ΔH/H', linewidth=1, color='purple')
+    ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
+    return True
+
+
+def _panel_dt(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('dt', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='dt', linewidth=1, color='teal')
+    ax.set_yscale('log')
+    return True
+
+
+def _panel_reversibility(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('reversibility', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='||E_out - E_in||', linewidth=1, color='darkorange')
+    ax.set_yscale('log' if max(v) > 0 else 'linear')
+    return True
+
+
+_PANELS = [
+    ("Losses",                _panel_loss),
+    ("W Gradient Norm",       lambda a, h, s: _panel_positive_line(a, h, s, 'grad_W', '||∇W||')),
+    ("Energy Drift ΔH/H",     _panel_h_drift),
+    ("Force on E",            lambda a, h, s: _panel_positive_line(a, h, s, 'force_E', '||F_E||')),
+    ("Momentum Norm",         lambda a, h, s: _panel_positive_line(a, h, s, 'P_norm',  '||P||')),
+    ("Timestep dt",           _panel_dt),
+    ("Reversibility Residual", _panel_reversibility),
+]
+
+
 def plot_training_history(history):
     """Generates Matplotlib plots from training history dictionary."""
-    # Check if history is valid and has steps
     if not history or not isinstance(history, dict) or not history.get('steps'):
         fig, ax = plt.subplots(1, 1, figsize=(6, 2))
         ax.text(0.5, 0.5, 'No training data yet', ha='center', va='center', fontsize=9)
         ax.axis('off')
-        # Close the figure explicitly BEFORE returning it
         plt.close(fig)
-        return fig # Return the closed figure object (Gradio might handle this)
+        return fig
 
-    fig, axes = plt.subplots(2, 2, figsize=(8, 5), constrained_layout=True) # Use constrained_layout
+    fig, axes = plt.subplots(3, 3, figsize=(10, 8), constrained_layout=True)
     fig.suptitle("Training Metrics", fontsize=12)
     steps = history.get('steps', [])
+    flat_axes = axes.flatten()
 
-    # --- Helper function to filter NaN/Inf and check if data exists ---
-    def filter_valid(data):
-        if not data: return []
-        return [x for x in data if x is not None and np.isfinite(x)]
-
-    # --- Plotting Data ---
-    train_l1 = filter_valid(history.get('train_l1', []))
-    train_l2 = filter_valid(history.get('train_l2', []))
-    test_l = filter_valid(history.get('test_l', []))
-    grad_w = filter_valid(history.get('grad_W', []))
-    force_e = filter_valid(history.get('force_E', []))
-    p_norm = filter_valid(history.get('P_norm', []))
-
-    # Align steps with filtered data if lengths mismatch (e.g., if NaN occurred mid-list)
-    steps_l = steps[:len(test_l)] if test_l else steps
-    steps_w = steps[:len(grad_w)] if grad_w else steps
-    steps_e = steps[:len(force_e)] if force_e else steps
-    steps_p = steps[:len(p_norm)] if p_norm else steps
-
-
-    # Loss Plot
-    ax = axes[0, 0]
-    if steps_l and test_l:
-        if train_l1: ax.plot(steps_l, train_l1[:len(steps_l)], label='L1', alpha=0.7, linewidth=1) # Align length
-        if train_l2: ax.plot(steps_l, train_l2[:len(steps_l)], label='L2->W', alpha=0.7, linewidth=1) # Align length
-        ax.plot(steps_l, test_l, label='Test Loss', linewidth=1.5, color='red')
-        ax.set_title('Losses', fontsize=10)
-        ax.set_ylabel('Loss', fontsize=9)
-        ax.grid(True, linestyle='--', alpha=0.6)
-        ax.legend(fontsize=8)
-        min_loss_plot = min(test_l) * 0.9
-        max_loss_plot = max(test_l) * 1.1
-        if max_loss_plot > min_loss_plot * 20: max_loss_plot = min_loss_plot * 20
-        ax.set_ylim(bottom=min_loss_plot, top=max_loss_plot)
-        ax.tick_params(axis='both', which='major', labelsize=8)
-        ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=5))
-    else:
-        ax.text(0.5, 0.5, 'Loss data pending', ha='center', va='center', fontsize=9); ax.axis('off')
-
-    # Grad W Plot
-    ax = axes[0, 1]
-    if steps_w and grad_w:
-        ax.plot(steps_w, grad_w, label='||∇W|| (pre)', linewidth=1)
-        ax.set_title('W Gradient Norm', fontsize=10)
-        ax.set_ylabel('Norm', fontsize=9)
-        ax.grid(True, linestyle='--', alpha=0.6)
-        ax.legend(fontsize=8)
-        ax.set_ylim(bottom=0, top=max(grad_w) * 1.1 if grad_w else 1.0)
-        ax.tick_params(axis='both', which='major', labelsize=8)
-        ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=5))
-    else:
-        ax.text(0.5, 0.5, '∇W data pending', ha='center', va='center', fontsize=9); ax.axis('off')
-
-    # Force E Plot
-    ax = axes[1, 0]
-    if steps_e and force_e:
-        ax.plot(steps_e, force_e, label='||F_E||', linewidth=1)
-        ax.set_title('Effective Force Norm on E', fontsize=10)
+    for ax, (title, drawer) in zip(flat_axes, _PANELS):
+        ax.set_title(title, fontsize=10)
+        try:
+            drew = drawer(ax, history, steps)
+        except Exception as e:
+            print(f"Panel '{title}' failed: {e}")
+            drew = False
+        if not drew:
+            ax.text(0.5, 0.5, 'pending', ha='center', va='center', fontsize=9)
+            ax.axis('off')
+            continue
         ax.set_xlabel('Step', fontsize=9)
-        ax.set_ylabel('Norm', fontsize=9)
         ax.grid(True, linestyle='--', alpha=0.6)
-        ax.legend(fontsize=8)
-        ax.set_ylim(bottom=0, top=max(force_e) * 1.1 if force_e else 1.0)
+        ax.legend(fontsize=8, loc='best')
         ax.tick_params(axis='both', which='major', labelsize=8)
         ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=5))
-    else:
-        ax.text(0.5, 0.5, 'F_E data pending', ha='center', va='center', fontsize=9); ax.axis('off')
 
-    # Momentum P Plot
-    ax = axes[1, 1]
-    if steps_p and p_norm:
-        ax.plot(steps_p, p_norm, label='||P||', linewidth=1)
-        ax.set_title('Momentum Matrix Norm', fontsize=10)
-        ax.set_xlabel('Step', fontsize=9)
-        ax.set_ylabel('Norm', fontsize=9)
-        ax.grid(True, linestyle='--', alpha=0.6)
-        ax.legend(fontsize=8)
-        ax.set_ylim(bottom=0, top=max(p_norm) * 1.1 if p_norm else 1.0)
-        ax.tick_params(axis='both', which='major', labelsize=8)
-        ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=5))
-    else:
-        ax.text(0.5, 0.5, '||P|| data pending', ha='center', va='center', fontsize=9); ax.axis('off')
+    # Hide any unused cells beyond the panel list.
+    for ax in flat_axes[len(_PANELS):]:
+        ax.axis('off')
 
-    # Close the figure BEFORE returning it - this might help with the memory warning
     plt.close(fig)
     return fig
 
@@ -270,7 +287,11 @@ def fetch_log_plot_history_update():
 
     # Plotting logic (using potentially stale history if trainer error)
     if not history:
-         history = {'steps': [], 'train_l1': [], 'train_l2': [], 'test_l': [], 'grad_W': [], 'force_E': [], 'P_norm': []}
+         history = {
+             'steps': [], 'train_l1': [], 'train_l2': [], 'test_l': [],
+             'grad_W': [], 'force_E': [], 'P_norm': [],
+             'H_drift': [], 'dt': [], 'reversibility': [],
+         }
     try:
          fig = plot_training_history(history)
     except Exception as e:
