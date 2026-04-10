@@ -21,9 +21,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from ..data.handling import save_vocab  # noqa: F401 - re-exported for callers
-from ..models.rnn import RNNCharModel
+from ..models import make_model
+from .action import ActionAccumulator
+from .adaptive import AdaptiveStepController
+from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
+from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
 from .integrators import make_integrator
+from .geometry import FisherMassConfig, FisherMassEstimator, fisher_diagonal_sample
+from .observables import ObservableWindow, snapshot
 from .utils import device, get_batch
 
 
@@ -43,7 +49,11 @@ class Trainer:
         self.idx_to_char = None
         self.vocab_size = None
 
-        self.integrator = make_integrator(config.get("integrator", "leapfrog"))
+        self.integrator = make_integrator(
+            config.get("integrator", "leapfrog"),
+            **config.get("integrator_params", {}),
+        )
+        self.adaptive = self._build_adaptive_controller(config)
 
         self.current_step = 0
         self.train_losses_l1: list[float] = []
@@ -54,14 +64,47 @@ class Trainer:
             "force_E": [],
             "P_norm": [],
             "H_drift": [],
+            "dt": [],
+            "reversibility": [],
+            "specific_heat": [],
+            "susceptibility": [],
+            "corr_time": [],
+            "entropy_rate": [],
+            "action": [],
+            "lagrangian": [],
         }
+        self._eval_counter = 0
         self._energy_reference = None
+        self._current_dt: float = float(config["dt"]) if "dt" in config else 0.01
+        self._observables = ObservableWindow(
+            size=int(config.get("observable_window", 32))
+        )
+        self._action = ActionAccumulator()
+        self._fisher: FisherMassEstimator | None = None
+        self._fisher_cfg: FisherMassConfig | None = None
 
         self.run_id = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
+
         self.save_dir = os.path.join(config.get("results_dir", "results"), self.run_id)
         os.makedirs(self.save_dir, exist_ok=True)
 
         self._stop_training_flag = False
+
+    @staticmethod
+    def _build_adaptive_controller(config) -> AdaptiveStepController | None:
+        if not config.get("adaptive_dt"):
+            return None
+        dt = float(config.get("dt", 0.01))
+        return AdaptiveStepController(
+            dt_init=dt,
+            dt_min=float(config.get("dt_min", dt * 1e-2)),
+            dt_max=float(config.get("dt_max", dt * 1e2)),
+            drift_high=float(config.get("drift_high", 1e-2)),
+            drift_low=float(config.get("drift_low", 1e-5)),
+            shrink=float(config.get("dt_shrink", 0.5)),
+            grow=float(config.get("dt_grow", 1.2)),
+            grow_after=int(config.get("dt_grow_after", 10)),
+        )
 
     def setup(
         self,
@@ -80,12 +123,7 @@ class Trainer:
         self.vocab_size = vocab_size
         self.mass_vector = mass_vector.to(device)
 
-        self.model = RNNCharModel(
-            vocab_size=self.vocab_size,
-            embedding_dim=self.config["embedding_dim"],
-            hidden_dim=self.config["hidden_dim"],
-            n_layers=self.config["n_layers"],
-        ).to(device)
+        self.model = make_model(self.vocab_size, self.config).to(device)
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Model instantiated with {n_params:,} params.")
 
@@ -108,10 +146,97 @@ class Trainer:
             f"| integrator: {self.integrator.name} (order {self.integrator.order})"
         )
 
+        if self.config.get("mass_mode") == "fisher":
+            self._fisher_cfg = FisherMassConfig(
+                beta=float(self.config.get("fisher_beta", 0.9)),
+                eps=float(self.config.get("fisher_eps", 1e-3)),
+                refresh_every=int(self.config.get("fisher_refresh_every", 50)),
+                batches_per_refresh=int(
+                    self.config.get("fisher_batches_per_refresh", 4)
+                ),
+            )
+            self._fisher = FisherMassEstimator(
+                shape=(self.vocab_size, self.config["embedding_dim"]),
+                config=self._fisher_cfg,
+            )
+            self._fisher.initialise(device, self.E.dtype)
+            self.mass_vector = self._fisher.current()
+            print(
+                f"Fisher mass: eps={self._fisher_cfg.eps} "
+                f"beta={self._fisher_cfg.beta} "
+                f"refresh_every={self._fisher_cfg.refresh_every}"
+            )
+        else:
+            self._fisher = None
+            self._fisher_cfg = None
+
         self.current_step = 0
         self._stop_training_flag = False
         self._energy_reference = None
+        self._current_dt = float(self.config["dt"])
+        if self.adaptive is not None:
+            self.adaptive.dt = self._current_dt
+        self._observables.clear()
+        self._action.reset()
         print("Trainer setup complete.")
+
+    def _refresh_fisher_mass(self) -> None:
+        """Blend a fresh diagonal empirical Fisher into the mass estimator."""
+        if self._fisher is None or self._fisher_cfg is None:
+            return
+        cfg = self._fisher_cfg
+        accum = torch.zeros_like(self.E)
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for _ in range(cfg.batches_per_refresh):
+                try:
+                    x, y = get_batch(
+                        self.train_data,
+                        self.config["context_window"],
+                        self.config["batch_size"],
+                        device,
+                    )
+                except ValueError:
+                    break
+                accum += fisher_diagonal_sample(
+                    self.model, self.criterion, self.E, x, y
+                )
+            accum /= max(cfg.batches_per_refresh, 1)
+            self._fisher.update(accum)
+            self.mass_vector = self._fisher.current()
+        finally:
+            if was_training:
+                self.model.train()
+
+    def _run_reversibility_probe(self, x_batch, y_batch) -> float:
+        """Integrate forward/backward on the current batch and return residual."""
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            frozen_params = [p.requires_grad for p in self.model.parameters()]
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+            try:
+                force_fn = make_rnn_force_fn(
+                    x_batch, y_batch, self.model, self.criterion
+                )
+                residual = measure_reversibility(
+                    self.integrator,
+                    self.E.detach(),
+                    self.P.detach(),
+                    self.mass_vector,
+                    force_fn,
+                    dt=self._current_dt,
+                    n_steps=int(self.config.get("reversibility_check_steps", 5)),
+                )
+                return residual.total
+            finally:
+                for p, was in zip(self.model.parameters(), frozen_params):
+                    p.requires_grad_(was)
+        finally:
+            if was_training:
+                self.model.train()
 
     def _step_embeddings(self, x_batch, y_batch):
         """Run one integrator step and return (new_E, new_P, loss1, loss2)."""
@@ -119,7 +244,7 @@ class Trainer:
         step = self.integrator.step(
             self.E,
             self.P,
-            self.config["dt"],
+            self._current_dt,
             force_fn,
             self.mass_vector,
             retain_final=True,
@@ -136,6 +261,9 @@ class Trainer:
         self.model.train()
         self.E.requires_grad_(True)
 
+        if self._fisher is not None and self._fisher.update_count == 0:
+            self._refresh_fisher_mass()
+
         print(f"Starting training from step {self.current_step}...")
 
         for step in range(self.current_step, self.config["num_steps"]):
@@ -143,6 +271,14 @@ class Trainer:
                 print(f"Training stopped externally at step {step}.")
                 yield {"status": "stopped", "step": step}
                 break
+
+            if (
+                self._fisher is not None
+                and self._fisher_cfg is not None
+                and step > self.current_step
+                and (step - self.current_step) % self._fisher_cfg.refresh_every == 0
+            ):
+                self._refresh_fisher_mass()
 
             x_batch, y_batch = get_batch(
                 self.train_data,
@@ -164,7 +300,7 @@ class Trainer:
                 break
 
             with torch.no_grad():
-                dt = self.config["dt"]
+                dt = self._current_dt
                 force_eff_norm = (
                     torch.linalg.norm((P_new - self.P) / dt).item() if dt else 0.0
                 )
@@ -203,6 +339,16 @@ class Trainer:
                 self._energy_reference = energy
             h_drift = energy.drift(self._energy_reference)
 
+            self._observables.push(snapshot(self.E, H=energy.total))
+            action_report = self._action.update(
+                kinetic=energy.kinetic,
+                potential=energy.potential,
+                dt=self._current_dt,
+            )
+
+            if self.adaptive is not None:
+                self._current_dt = self.adaptive.observe(h_drift)
+
             eval_every = self.config["eval_interval"]
             is_eval_step = (
                 self.current_step % eval_every == 0
@@ -214,6 +360,22 @@ class Trainer:
             eval_results = self.evaluate()
             test_loss = eval_results["test_loss"]
 
+            self._eval_counter += 1
+            rev_interval = int(self.config.get("reversibility_check_interval", 0))
+            if rev_interval and self._eval_counter % rev_interval == 0:
+                rev_residual = self._run_reversibility_probe(x_batch, y_batch)
+            else:
+                rev_residual = float("nan")
+
+            obs_report = self._observables.report()
+            if obs_report is not None:
+                c_v = obs_report.specific_heat
+                chi = obs_report.susceptibility
+                tau = obs_report.corr_time
+                s_rate = obs_report.entropy_rate
+            else:
+                c_v = chi = tau = s_rate = float("nan")
+
             self.train_losses_l1.append(loss_l1.item())
             self.train_losses_l2.append(loss_l2.item())
             self.test_losses.append(test_loss)
@@ -221,13 +383,21 @@ class Trainer:
             self.debug_stats["force_E"].append(force_eff_norm)
             self.debug_stats["P_norm"].append(p_norm)
             self.debug_stats["H_drift"].append(h_drift)
+            self.debug_stats["dt"].append(self._current_dt)
+            self.debug_stats["reversibility"].append(rev_residual)
+            self.debug_stats["specific_heat"].append(c_v)
+            self.debug_stats["susceptibility"].append(chi)
+            self.debug_stats["corr_time"].append(tau)
+            self.debug_stats["entropy_rate"].append(s_rate)
+            self.debug_stats["action"].append(action_report.S)
+            self.debug_stats["lagrangian"].append(action_report.L)
 
             elapsed = time.time() - start_time
             log_message = (
                 f"Step {self.current_step}/{self.config['num_steps']} | T: {elapsed:.1f}s "
                 f"| L1: {loss_l1.item():.4f} | L2->W: {loss_l2.item():.4f} | Test L: {test_loss:.4f} "
                 f"| ||∇W||: {total_norm_W_before:.3f} | ||F_E||: {force_eff_norm:.3f} "
-                f"| ||P||: {p_norm:.3f} | ΔH/H: {h_drift:.3e}"
+                f"| ||P||: {p_norm:.3f} | ΔH/H: {h_drift:.3e} | dt: {self._current_dt:.3e}"
             )
             print(log_message)
 
@@ -242,6 +412,7 @@ class Trainer:
                 "force_E_norm": force_eff_norm,
                 "P_norm": p_norm,
                 "H_drift": h_drift,
+                "dt": self._current_dt,
                 "log_message": log_message,
                 "history": self.get_history(),
             }
@@ -321,13 +492,19 @@ class Trainer:
             print("Warning: Cannot save checkpoint, trainer not fully initialized.")
             return
 
+        E_cpu = self.E.detach().cpu()
+        P_cpu = self.P.detach().cpu()
+        mass_cpu = self.mass_vector.detach().cpu()
+        integrity = compute_integrity(E_cpu, P_cpu, mass_cpu)
         state = {
             "step": self.current_step,
             "config": self.config,
             "vocab_size": self.vocab_size,
             "model_state_dict": self.model.state_dict(),
-            "E": self.E.detach().cpu(),
-            "P": self.P.detach().cpu(),
+            "E": E_cpu,
+            "P": P_cpu,
+            "mass_vector": mass_cpu,
+            "integrity": integrity.to_dict(),
             "optimizer_W_state_dict": self.optimizer_W.state_dict(),
             "train_losses_l1": self.train_losses_l1,
             "train_losses_l2": self.train_losses_l2,
@@ -348,18 +525,33 @@ class Trainer:
             checkpoint = torch.load(filepath, map_location=device)
             print(f"Loading checkpoint from {filepath}...")
 
+            saved_fp = checkpoint.get("integrity")
+            if saved_fp is not None:
+                mass_cpu = checkpoint.get("mass_vector")
+                if mass_cpu is None:
+                    print("Checkpoint has integrity fingerprint but no mass_vector; refusing.")
+                    return False
+                fresh = compute_integrity(
+                    checkpoint["E"], checkpoint["P"], mass_cpu
+                )
+                report = verify_integrity(
+                    CheckpointIntegrity.from_dict(saved_fp), fresh
+                )
+                if not report.ok:
+                    print(report.format())
+                    return False
+                print(report.format())
+
             self.config = checkpoint["config"]
             self.vocab_size = checkpoint["vocab_size"]
             self.char_to_idx = checkpoint["char_to_idx"]
             self.idx_to_char = checkpoint["idx_to_char"]
-            self.integrator = make_integrator(self.config.get("integrator", "leapfrog"))
+            self.integrator = make_integrator(
+                self.config.get("integrator", "leapfrog"),
+                **self.config.get("integrator_params", {}),
+            )
 
-            self.model = RNNCharModel(
-                vocab_size=self.vocab_size,
-                embedding_dim=self.config["embedding_dim"],
-                hidden_dim=self.config["hidden_dim"],
-                n_layers=self.config["n_layers"],
-            ).to(device)
+            self.model = make_model(self.vocab_size, self.config).to(device)
             self.optimizer_W = optim.Adam(
                 self.model.parameters(), lr=self.config["learning_rate_W"]
             )
@@ -367,17 +559,56 @@ class Trainer:
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.E = checkpoint["E"].to(device).requires_grad_(True)
             self.P = checkpoint["P"].to(device)
+            if "mass_vector" in checkpoint and checkpoint["mass_vector"] is not None:
+                self.mass_vector = checkpoint["mass_vector"].to(device)
+            if self.config.get("mass_mode") == "fisher":
+                self._fisher_cfg = FisherMassConfig(
+                    beta=float(self.config.get("fisher_beta", 0.9)),
+                    eps=float(self.config.get("fisher_eps", 1e-3)),
+                    refresh_every=int(self.config.get("fisher_refresh_every", 50)),
+                    batches_per_refresh=int(
+                        self.config.get("fisher_batches_per_refresh", 4)
+                    ),
+                )
+                self._fisher = FisherMassEstimator(
+                    shape=tuple(self.mass_vector.shape),
+                    config=self._fisher_cfg,
+                )
+                self._fisher.mass = self.mass_vector
+            else:
+                self._fisher = None
+                self._fisher_cfg = None
             self.optimizer_W.load_state_dict(checkpoint["optimizer_W_state_dict"])
             self.current_step = checkpoint["step"]
             self.train_losses_l1 = checkpoint["train_losses_l1"]
             self.train_losses_l2 = checkpoint["train_losses_l2"]
             self.test_losses = checkpoint["test_losses"]
             loaded_debug = checkpoint["debug_stats"]
-            # Back-compat: older checkpoints had no H_drift column.
-            loaded_debug.setdefault("H_drift", [0.0] * len(self.test_losses))
+            # Back-compat: older checkpoints may be missing any of these columns.
+            n = len(self.test_losses)
+            loaded_debug.setdefault("H_drift", [0.0] * n)
+            loaded_debug.setdefault(
+                "dt", [float(self.config.get("dt", 0.01))] * n
+            )
+            loaded_debug.setdefault("reversibility", [float("nan")] * n)
+            for key in (
+                "specific_heat",
+                "susceptibility",
+                "corr_time",
+                "entropy_rate",
+                "action",
+                "lagrangian",
+            ):
+                loaded_debug.setdefault(key, [float("nan")] * n)
             self.debug_stats = loaded_debug
+            self.adaptive = self._build_adaptive_controller(self.config)
+            self._current_dt = float(self.config["dt"])
+            if self.adaptive is not None:
+                self.adaptive.dt = self._current_dt
             self.save_dir = os.path.dirname(filepath)
             self._energy_reference = None
+            self._observables.clear()
+            self._action.reset()
 
             print(f"Checkpoint loaded. Resuming from step {self.current_step}")
             return True
@@ -405,46 +636,57 @@ class Trainer:
             "force_E": self.debug_stats["force_E"],
             "P_norm": self.debug_stats["P_norm"],
             "H_drift": self.debug_stats.get("H_drift", []),
+            "dt": self.debug_stats.get("dt", []),
+            "reversibility": self.debug_stats.get("reversibility", []),
+            "specific_heat": self.debug_stats.get("specific_heat", []),
+            "susceptibility": self.debug_stats.get("susceptibility", []),
+            "corr_time": self.debug_stats.get("corr_time", []),
+            "entropy_rate": self.debug_stats.get("entropy_rate", []),
+            "action": self.debug_stats.get("action", []),
+            "lagrangian": self.debug_stats.get("lagrangian", []),
         }
 
     def generate(self, start_prompt, length, temperature):
+        """Sample ``length`` new characters after ``start_prompt``.
+
+        Each decoding step feeds the full tail of the generated sequence
+        to the model and takes the last-position logits. This works
+        uniformly for the RNN (which could use incremental hidden state
+        but doesn't need to for correctness) and the transformer (which
+        requires the full context window every step).
+        """
         if not self.model or self.E is None or self.idx_to_char is None:
             return "Error: Model not loaded or trainer not set up."
 
         print(f"Generating text (temp={temperature}): '{start_prompt}'")
         was_training = self.model.training
         self.model.eval()
+
+        max_ctx = getattr(
+            self.model, "max_context", self.config.get("context_window", 1024)
+        )
+
         try:
-            generated_indices = [
-                self.char_to_idx.get(char, 0) for char in start_prompt
-            ]
-            hidden = self.model.init_hidden(batch_size=1)
+            generated = [self.char_to_idx.get(ch, 0) for ch in start_prompt]
+            if not generated:
+                generated = [int(torch.randint(0, self.vocab_size, (1,)).item())]
 
             with torch.no_grad():
-                if generated_indices:
-                    context = torch.tensor(
-                        [generated_indices], dtype=torch.long, device=device
-                    )
-                    prompt_embeddings = F.embedding(context, self.E.detach())
-                    _, hidden = self.model(prompt_embeddings, hidden)
-                    current_input_idx = torch.tensor(
-                        [[generated_indices[-1]]], dtype=torch.long, device=device
-                    )
-                else:
-                    current_input_idx = torch.randint(
-                        0, self.vocab_size, (1, 1), device=device
-                    )
-
                 for _ in range(length):
-                    emb = F.embedding(current_input_idx, self.E.detach())
-                    logits, hidden = self.model(emb, hidden)
-                    scaled = logits.squeeze(1) / max(temperature, 1e-6)
+                    window = generated[-max_ctx:]
+                    context = torch.tensor(
+                        [window], dtype=torch.long, device=device
+                    )
+                    emb = F.embedding(context, self.E.detach())
+                    hidden = self.model.init_hidden(batch_size=1)
+                    logits, _ = self.model(emb, hidden)
+                    last_logits = logits[:, -1, :]
+                    scaled = last_logits / max(temperature, 1e-6)
                     probs = F.softmax(scaled, dim=-1)
                     next_idx = torch.multinomial(probs, num_samples=1)
-                    generated_indices.append(int(next_idx.item()))
-                    current_input_idx = next_idx
+                    generated.append(int(next_idx.item()))
         finally:
             if was_training:
                 self.model.train()
 
-        return "".join(self.idx_to_char.get(i, "?") for i in generated_indices)
+        return "".join(self.idx_to_char.get(i, "?") for i in generated)

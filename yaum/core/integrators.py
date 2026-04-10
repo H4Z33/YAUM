@@ -10,8 +10,10 @@ kicks around a drift. Turtles all the way down.
 """
 from __future__ import annotations
 
+import inspect
+import math
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Union
 
 import torch
 
@@ -122,16 +124,190 @@ class YoshidaIntegrator(SymplecticIntegrator):
         )
 
 
-INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
+class LangevinIntegrator(SymplecticIntegrator):
+    """OBABO-split Langevin dynamics (Leimkuhler & Matthews, 2013).
+
+    A deterministic symplectic core is flanked by two Ornstein–Uhlenbeck
+    half-steps that exchange momentum with a heat bath at temperature
+    ``kT`` with friction ``gamma``. The resulting flow samples the
+    canonical ensemble, trading strict energy conservation for the
+    ability to explore ``(E, P)`` configurations at a fixed temperature.
+
+    The core defaults to leapfrog but accepts any other
+    :class:`SymplecticIntegrator` — passing ``"yoshida4"`` gives
+    fourth-order deterministic accuracy inside the thermostat.
+    """
+
+    name = "langevin"
+    order = 2
+
+    def __init__(
+        self,
+        friction: float = 1.0,
+        temperature: float = 1.0,
+        core: Union[str, "SymplecticIntegrator"] = "leapfrog",
+    ):
+        if friction < 0:
+            raise ValueError("friction must be >= 0")
+        if temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        self.gamma = float(friction)
+        self.kT = float(temperature)
+        if isinstance(core, str):
+            if core not in _CORE_INTEGRATORS:
+                raise ValueError(
+                    f"Unknown core integrator {core!r}. "
+                    f"Available: {sorted(_CORE_INTEGRATORS)}"
+                )
+            self.core = _CORE_INTEGRATORS[core]()
+        else:
+            self.core = core
+
+    def _ou_half(self, P: torch.Tensor, half_dt: float, mass: torch.Tensor) -> torch.Tensor:
+        if self.gamma == 0.0:
+            return P
+        c = math.exp(-self.gamma * half_dt)
+        variance = mass * self.kT * (1.0 - c * c)
+        sigma = torch.sqrt(torch.clamp(variance, min=0.0))
+        noise = torch.randn_like(P)
+        return c * P + sigma * noise
+
+    def step(self, E, P, dt, force_fn, mass, retain_final=True):
+        P_in = self._ou_half(P, dt * 0.5, mass)
+        inner = self.core.step(E, P_in, dt, force_fn, mass, retain_final=retain_final)
+        P_out = self._ou_half(inner.P, dt * 0.5, mass)
+        return PhaseStep(
+            E=inner.E,
+            P=P_out,
+            loss_initial=inner.loss_initial,
+            loss_final=inner.loss_final,
+            n_force_evals=inner.n_force_evals,
+        )
+
+
+_CORE_INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
     LeapfrogIntegrator.name: LeapfrogIntegrator,
     YoshidaIntegrator.name: YoshidaIntegrator,
 }
 
 
-def make_integrator(name: str) -> SymplecticIntegrator:
+class MultiScaleIntegrator(SymplecticIntegrator):
+    """rRESPA-style multi-time-step integrator. Turtles, literal.
+
+    Splits the potential into a cheap slow part and a costly fast part:
+
+        V(E) = V_fast(E) + V_slow(E)
+
+    * ``V_fast`` is whatever the caller passes through ``force_fn`` —
+      typically the model's data loss.
+    * ``V_slow`` is an analytical L2 prior ``0.5 * slow_lambda * ||E||^2``
+      whose force is just ``-slow_lambda * E`` — free to evaluate.
+
+    One outer step of size ``dt`` runs::
+
+        P += F_slow(E) * dt/2              # outer slow kick
+        for i in range(n_inner):
+            inner.step(E, P, dt / n_inner) # expensive fast propagator
+        P += F_slow(E) * dt/2              # outer slow kick
+
+    So the fast loss is evaluated ``O(n_inner)`` times per outer step
+    while the cheap regulariser is evaluated twice. With ``slow_lambda=0``
+    and ``n_inner=1`` this is exactly the inner integrator.
+    """
+
+    name = "multiscale"
+    order = 2
+
+    def __init__(
+        self,
+        inner: Union[str, "SymplecticIntegrator"] = "leapfrog",
+        n_inner: int = 4,
+        slow_lambda: float = 1e-3,
+    ):
+        if n_inner < 1:
+            raise ValueError("n_inner must be >= 1")
+        if slow_lambda < 0:
+            raise ValueError("slow_lambda must be >= 0")
+        self.n_inner = int(n_inner)
+        self.slow_lambda = float(slow_lambda)
+        if isinstance(inner, str):
+            if inner not in _CORE_INTEGRATORS:
+                raise ValueError(
+                    f"Unknown inner integrator {inner!r}. "
+                    f"Available: {sorted(_CORE_INTEGRATORS)}"
+                )
+            self.inner = _CORE_INTEGRATORS[inner]()
+        else:
+            self.inner = inner
+
+    def _slow_force(self, E: torch.Tensor) -> torch.Tensor:
+        """Force from V_slow = 0.5 * lambda * ||E||^2."""
+        if self.slow_lambda == 0.0:
+            return torch.zeros_like(E)
+        return -self.slow_lambda * E.detach()
+
+    def step(self, E, P, dt, force_fn, mass, retain_final=True):
+        half = dt * 0.5
+        P_cur = P + self._slow_force(E) * half
+
+        E_cur = E
+        sub_dt = dt / self.n_inner
+        loss_initial = None
+        loss_final = None
+        n_evals = 0
+        for i in range(self.n_inner):
+            is_last = i == self.n_inner - 1
+            sub = self.inner.step(
+                E_cur,
+                P_cur,
+                sub_dt,
+                force_fn,
+                mass,
+                retain_final=is_last and retain_final,
+            )
+            if i == 0:
+                loss_initial = sub.loss_initial
+            if is_last:
+                loss_final = sub.loss_final
+            E_cur = sub.E
+            P_cur = sub.P
+            n_evals += sub.n_force_evals
+
+        P_cur = P_cur + self._slow_force(E_cur) * half
+
+        return PhaseStep(
+            E=E_cur,
+            P=P_cur,
+            loss_initial=loss_initial,
+            loss_final=loss_final,
+            n_force_evals=n_evals,
+        )
+
+
+INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
+    **_CORE_INTEGRATORS,
+    LangevinIntegrator.name: LangevinIntegrator,
+    MultiScaleIntegrator.name: MultiScaleIntegrator,
+}
+
+
+def make_integrator(name: str, **params) -> SymplecticIntegrator:
+    """Instantiate an integrator by name, forwarding any parameters it accepts.
+
+    Unknown keyword arguments are silently dropped so callers can pass a
+    loose config dict without having to know which integrator they are
+    constructing.
+    """
     try:
-        return INTEGRATORS[name]()
+        cls = INTEGRATORS[name]
     except KeyError as err:
         raise ValueError(
             f"Unknown integrator {name!r}. Available: {sorted(INTEGRATORS)}"
         ) from err
+    signature = inspect.signature(cls.__init__)
+    accepted = {
+        key: value
+        for key, value in params.items()
+        if key in signature.parameters
+    }
+    return cls(**accepted)
