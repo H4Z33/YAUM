@@ -22,6 +22,7 @@ import torch.optim as optim
 
 from ..data.handling import save_vocab  # noqa: F401 - re-exported for callers
 from ..models import make_model
+from .action import ActionAccumulator
 from .adaptive import AdaptiveStepController
 from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
@@ -69,6 +70,8 @@ class Trainer:
             "susceptibility": [],
             "corr_time": [],
             "entropy_rate": [],
+            "action": [],
+            "lagrangian": [],
         }
         self._eval_counter = 0
         self._energy_reference = None
@@ -76,6 +79,7 @@ class Trainer:
         self._observables = ObservableWindow(
             size=int(config.get("observable_window", 32))
         )
+        self._action = ActionAccumulator()
         self._fisher: FisherMassEstimator | None = None
         self._fisher_cfg: FisherMassConfig | None = None
 
@@ -173,6 +177,7 @@ class Trainer:
         if self.adaptive is not None:
             self.adaptive.dt = self._current_dt
         self._observables.clear()
+        self._action.reset()
         print("Trainer setup complete.")
 
     def _refresh_fisher_mass(self) -> None:
@@ -335,6 +340,11 @@ class Trainer:
             h_drift = energy.drift(self._energy_reference)
 
             self._observables.push(snapshot(self.E, H=energy.total))
+            action_report = self._action.update(
+                kinetic=energy.kinetic,
+                potential=energy.potential,
+                dt=self._current_dt,
+            )
 
             if self.adaptive is not None:
                 self._current_dt = self.adaptive.observe(h_drift)
@@ -379,6 +389,8 @@ class Trainer:
             self.debug_stats["susceptibility"].append(chi)
             self.debug_stats["corr_time"].append(tau)
             self.debug_stats["entropy_rate"].append(s_rate)
+            self.debug_stats["action"].append(action_report.S)
+            self.debug_stats["lagrangian"].append(action_report.L)
 
             elapsed = time.time() - start_time
             log_message = (
@@ -579,7 +591,14 @@ class Trainer:
                 "dt", [float(self.config.get("dt", 0.01))] * n
             )
             loaded_debug.setdefault("reversibility", [float("nan")] * n)
-            for key in ("specific_heat", "susceptibility", "corr_time", "entropy_rate"):
+            for key in (
+                "specific_heat",
+                "susceptibility",
+                "corr_time",
+                "entropy_rate",
+                "action",
+                "lagrangian",
+            ):
                 loaded_debug.setdefault(key, [float("nan")] * n)
             self.debug_stats = loaded_debug
             self.adaptive = self._build_adaptive_controller(self.config)
@@ -589,6 +608,7 @@ class Trainer:
             self.save_dir = os.path.dirname(filepath)
             self._energy_reference = None
             self._observables.clear()
+            self._action.reset()
 
             print(f"Checkpoint loaded. Resuming from step {self.current_step}")
             return True
@@ -622,6 +642,8 @@ class Trainer:
             "susceptibility": self.debug_stats.get("susceptibility", []),
             "corr_time": self.debug_stats.get("corr_time", []),
             "entropy_rate": self.debug_stats.get("entropy_rate", []),
+            "action": self.debug_stats.get("action", []),
+            "lagrangian": self.debug_stats.get("lagrangian", []),
         }
 
     def generate(self, start_prompt, length, temperature):

@@ -199,6 +199,24 @@ def test_reversibility_disabled_by_default_records_nan(tmp_path):
     assert all(r != r for r in recorded)
 
 
+def test_action_telemetry_populates_history(tmp_path):
+    torch.manual_seed(0)
+    trainer = Trainer(_tiny_config(tmp_path, num_steps=4))
+    _tiny_setup(trainer)
+    list(trainer.train())
+    history = trainer.get_history()
+    n = len(history["test_l"])
+    assert "action" in history
+    assert "lagrangian" in history
+    assert len(history["action"]) == n
+    assert len(history["lagrangian"]) == n
+    # All entries must be finite real numbers; the running S is a cumulative
+    # sum of L*dt, so at least one record should have landed.
+    assert all(v == v for v in history["action"])  # not NaN
+    assert all(v == v for v in history["lagrangian"])
+    assert trainer._action.steps >= 1
+
+
 def test_phase_transition_observables_populate_history(tmp_path):
     torch.manual_seed(0)
     config = _tiny_config(tmp_path, num_steps=6)

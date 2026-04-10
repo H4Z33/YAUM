@@ -252,6 +252,24 @@ def _panel_entropy_rate(ax, history, steps):
     return True
 
 
+def _panel_action(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('action', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='S = ∫L dt', linewidth=1, color='indigo')
+    ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
+    return True
+
+
+def _panel_lagrangian(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('lagrangian', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='L = T − V', linewidth=1, color='darkslategrey')
+    ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
+    return True
+
+
 _PANELS = [
     ("Losses",                  _panel_loss),
     ("W Gradient Norm",         lambda a, h, s: _panel_positive_line(a, h, s, 'grad_W', '||∇W||')),
@@ -264,6 +282,8 @@ _PANELS = [
     ("Susceptibility",          _panel_susceptibility),
     ("Correlation Time τ_int",  _panel_corr_time),
     ("Entropy Rate dS/dt",      _panel_entropy_rate),
+    ("Action S = ∫L dt",        _panel_action),
+    ("Lagrangian L = T − V",    _panel_lagrangian),
 ]
 
 
@@ -276,7 +296,7 @@ def plot_training_history(history):
         plt.close(fig)
         return fig
 
-    fig, axes = plt.subplots(4, 3, figsize=(11, 11), constrained_layout=True)
+    fig, axes = plt.subplots(5, 3, figsize=(11, 13), constrained_layout=True)
     fig.suptitle("Training Metrics + Phase-Transition Telemetry", fontsize=12)
     steps = history.get('steps', [])
     flat_axes = axes.flatten()
@@ -333,6 +353,7 @@ def fetch_log_plot_history_update():
              'H_drift': [], 'dt': [], 'reversibility': [],
              'specific_heat': [], 'susceptibility': [],
              'corr_time': [], 'entropy_rate': [],
+             'action': [], 'lagrangian': [],
          }
     try:
          fig = plot_training_history(history)
