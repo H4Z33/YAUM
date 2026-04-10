@@ -21,7 +21,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from ..data.handling import save_vocab  # noqa: F401 - re-exported for callers
-from ..models.rnn import RNNCharModel
+from ..models import make_model
 from .adaptive import AdaptiveStepController
 from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
@@ -107,12 +107,7 @@ class Trainer:
         self.vocab_size = vocab_size
         self.mass_vector = mass_vector.to(device)
 
-        self.model = RNNCharModel(
-            vocab_size=self.vocab_size,
-            embedding_dim=self.config["embedding_dim"],
-            hidden_dim=self.config["hidden_dim"],
-            n_layers=self.config["n_layers"],
-        ).to(device)
+        self.model = make_model(self.vocab_size, self.config).to(device)
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Model instantiated with {n_params:,} params.")
 
@@ -429,12 +424,7 @@ class Trainer:
                 **self.config.get("integrator_params", {}),
             )
 
-            self.model = RNNCharModel(
-                vocab_size=self.vocab_size,
-                embedding_dim=self.config["embedding_dim"],
-                hidden_dim=self.config["hidden_dim"],
-                n_layers=self.config["n_layers"],
-            ).to(device)
+            self.model = make_model(self.vocab_size, self.config).to(device)
             self.optimizer_W = optim.Adam(
                 self.model.parameters(), lr=self.config["learning_rate_W"]
             )
@@ -494,43 +484,46 @@ class Trainer:
         }
 
     def generate(self, start_prompt, length, temperature):
+        """Sample ``length`` new characters after ``start_prompt``.
+
+        Each decoding step feeds the full tail of the generated sequence
+        to the model and takes the last-position logits. This works
+        uniformly for the RNN (which could use incremental hidden state
+        but doesn't need to for correctness) and the transformer (which
+        requires the full context window every step).
+        """
         if not self.model or self.E is None or self.idx_to_char is None:
             return "Error: Model not loaded or trainer not set up."
 
         print(f"Generating text (temp={temperature}): '{start_prompt}'")
         was_training = self.model.training
         self.model.eval()
+
+        max_ctx = getattr(
+            self.model, "max_context", self.config.get("context_window", 1024)
+        )
+
         try:
-            generated_indices = [
-                self.char_to_idx.get(char, 0) for char in start_prompt
-            ]
-            hidden = self.model.init_hidden(batch_size=1)
+            generated = [self.char_to_idx.get(ch, 0) for ch in start_prompt]
+            if not generated:
+                generated = [int(torch.randint(0, self.vocab_size, (1,)).item())]
 
             with torch.no_grad():
-                if generated_indices:
-                    context = torch.tensor(
-                        [generated_indices], dtype=torch.long, device=device
-                    )
-                    prompt_embeddings = F.embedding(context, self.E.detach())
-                    _, hidden = self.model(prompt_embeddings, hidden)
-                    current_input_idx = torch.tensor(
-                        [[generated_indices[-1]]], dtype=torch.long, device=device
-                    )
-                else:
-                    current_input_idx = torch.randint(
-                        0, self.vocab_size, (1, 1), device=device
-                    )
-
                 for _ in range(length):
-                    emb = F.embedding(current_input_idx, self.E.detach())
-                    logits, hidden = self.model(emb, hidden)
-                    scaled = logits.squeeze(1) / max(temperature, 1e-6)
+                    window = generated[-max_ctx:]
+                    context = torch.tensor(
+                        [window], dtype=torch.long, device=device
+                    )
+                    emb = F.embedding(context, self.E.detach())
+                    hidden = self.model.init_hidden(batch_size=1)
+                    logits, _ = self.model(emb, hidden)
+                    last_logits = logits[:, -1, :]
+                    scaled = last_logits / max(temperature, 1e-6)
                     probs = F.softmax(scaled, dim=-1)
                     next_idx = torch.multinomial(probs, num_samples=1)
-                    generated_indices.append(int(next_idx.item()))
-                    current_input_idx = next_idx
+                    generated.append(int(next_idx.item()))
         finally:
             if was_training:
                 self.model.train()
 
-        return "".join(self.idx_to_char.get(i, "?") for i in generated_indices)
+        return "".join(self.idx_to_char.get(i, "?") for i in generated)

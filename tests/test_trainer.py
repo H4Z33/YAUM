@@ -135,6 +135,23 @@ def test_trainer_runs_with_multiscale_integrator(tmp_path):
     assert trainer.integrator.n_inner == 3
 
 
+def test_trainer_trains_transformer_end_to_end(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=2)
+    config["model_type"] = "transformer"
+    config["embedding_dim"] = 8  # must be divisible by n_heads
+    config["n_heads"] = 2
+    config["max_context"] = 8
+    config["context_window"] = 6
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    events = list(trainer.train())
+    assert events[-1]["status"] == "finished"
+    # Generate must also work for the transformer path.
+    out = trainer.generate(start_prompt="ab", length=5, temperature=1.0)
+    assert len(out) == 2 + 5
+
+
 def test_trainer_runs_with_langevin_thermostat(tmp_path):
     torch.manual_seed(0)
     config = _tiny_config(tmp_path, integrator="langevin", num_steps=2)
