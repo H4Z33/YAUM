@@ -42,6 +42,24 @@ This project provides a framework and application for training Language Models (
 
 ## How to Run
 
+### One-liner via uv (recommended)
+
+Both scripts auto-install [`uv`](https://github.com/astral-sh/uv) on first run,
+resolve Python 3.10+, install the dependencies in an isolated environment,
+and launch the Gradio UI.
+
+```bash
+# Linux / macOS
+./run.sh
+
+# Windows PowerShell
+.\run.ps1
+```
+
+Any extra arguments are forwarded to `python -m yaum.ui.app`.
+
+### Manual
+
 1.  **Ensure dependencies are installed.**
 2.  **Run the Gradio application:**
     ```bash
