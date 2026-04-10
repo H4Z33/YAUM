@@ -23,6 +23,7 @@ import torch.optim as optim
 from ..data.handling import save_vocab  # noqa: F401 - re-exported for callers
 from ..models.rnn import RNNCharModel
 from .adaptive import AdaptiveStepController
+from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
 from .integrators import make_integrator
 from .utils import device, get_batch
@@ -57,7 +58,9 @@ class Trainer:
             "P_norm": [],
             "H_drift": [],
             "dt": [],
+            "reversibility": [],
         }
+        self._eval_counter = 0
         self._energy_reference = None
         self._current_dt: float = float(config["dt"]) if "dt" in config else 0.01
 
@@ -136,6 +139,35 @@ class Trainer:
         if self.adaptive is not None:
             self.adaptive.dt = self._current_dt
         print("Trainer setup complete.")
+
+    def _run_reversibility_probe(self, x_batch, y_batch) -> float:
+        """Integrate forward/backward on the current batch and return residual."""
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            frozen_params = [p.requires_grad for p in self.model.parameters()]
+            for p in self.model.parameters():
+                p.requires_grad_(False)
+            try:
+                force_fn = make_rnn_force_fn(
+                    x_batch, y_batch, self.model, self.criterion
+                )
+                residual = measure_reversibility(
+                    self.integrator,
+                    self.E.detach(),
+                    self.P.detach(),
+                    self.mass_vector,
+                    force_fn,
+                    dt=self._current_dt,
+                    n_steps=int(self.config.get("reversibility_check_steps", 5)),
+                )
+                return residual.total
+            finally:
+                for p, was in zip(self.model.parameters(), frozen_params):
+                    p.requires_grad_(was)
+        finally:
+            if was_training:
+                self.model.train()
 
     def _step_embeddings(self, x_batch, y_batch):
         """Run one integrator step and return (new_E, new_P, loss1, loss2)."""
@@ -241,6 +273,13 @@ class Trainer:
             eval_results = self.evaluate()
             test_loss = eval_results["test_loss"]
 
+            self._eval_counter += 1
+            rev_interval = int(self.config.get("reversibility_check_interval", 0))
+            if rev_interval and self._eval_counter % rev_interval == 0:
+                rev_residual = self._run_reversibility_probe(x_batch, y_batch)
+            else:
+                rev_residual = float("nan")
+
             self.train_losses_l1.append(loss_l1.item())
             self.train_losses_l2.append(loss_l2.item())
             self.test_losses.append(test_loss)
@@ -249,6 +288,7 @@ class Trainer:
             self.debug_stats["P_norm"].append(p_norm)
             self.debug_stats["H_drift"].append(h_drift)
             self.debug_stats["dt"].append(self._current_dt)
+            self.debug_stats["reversibility"].append(rev_residual)
 
             elapsed = time.time() - start_time
             log_message = (
@@ -402,11 +442,13 @@ class Trainer:
             self.train_losses_l2 = checkpoint["train_losses_l2"]
             self.test_losses = checkpoint["test_losses"]
             loaded_debug = checkpoint["debug_stats"]
-            # Back-compat: older checkpoints had no H_drift or dt columns.
-            loaded_debug.setdefault("H_drift", [0.0] * len(self.test_losses))
+            # Back-compat: older checkpoints may be missing any of these columns.
+            n = len(self.test_losses)
+            loaded_debug.setdefault("H_drift", [0.0] * n)
             loaded_debug.setdefault(
-                "dt", [float(self.config.get("dt", 0.01))] * len(self.test_losses)
+                "dt", [float(self.config.get("dt", 0.01))] * n
             )
+            loaded_debug.setdefault("reversibility", [float("nan")] * n)
             self.debug_stats = loaded_debug
             self.adaptive = self._build_adaptive_controller(self.config)
             self._current_dt = float(self.config["dt"])
@@ -442,6 +484,7 @@ class Trainer:
             "P_norm": self.debug_stats["P_norm"],
             "H_drift": self.debug_stats.get("H_drift", []),
             "dt": self.debug_stats.get("dt", []),
+            "reversibility": self.debug_stats.get("reversibility", []),
         }
 
     def generate(self, start_prompt, length, temperature):

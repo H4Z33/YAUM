@@ -124,6 +124,33 @@ def test_adaptive_dt_off_by_default(tmp_path):
     assert trainer.adaptive is None
 
 
+def test_reversibility_probe_records_residuals(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=4)
+    config["reversibility_check_interval"] = 1
+    config["reversibility_check_steps"] = 3
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    list(trainer.train())
+    history = trainer.get_history()
+    assert "reversibility" in history
+    recorded = history["reversibility"]
+    assert len(recorded) == len(history["test_l"])
+    # All eval ticks should have produced finite numbers, not NaN sentinels.
+    assert all(not (r != r) for r in recorded)
+
+
+def test_reversibility_disabled_by_default_records_nan(tmp_path):
+    torch.manual_seed(0)
+    trainer = Trainer(_tiny_config(tmp_path, num_steps=4))
+    _tiny_setup(trainer)
+    list(trainer.train())
+    recorded = trainer.get_history()["reversibility"]
+    # Disabled => sentinel NaN on every eval tick.
+    assert len(recorded) > 0
+    assert all(r != r for r in recorded)
+
+
 def test_adaptive_dt_controller_wires_in_and_records_dt(tmp_path):
     torch.manual_seed(0)
     config = _tiny_config(tmp_path, num_steps=4)
