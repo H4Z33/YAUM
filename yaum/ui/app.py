@@ -216,14 +216,54 @@ def _panel_reversibility(ax, history, steps):
     return True
 
 
+def _panel_specific_heat(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('specific_heat', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='C_v = Var(H)', linewidth=1, color='crimson')
+    ax.set_ylim(bottom=0, top=max(v) * 1.1 if max(v) > 0 else 1.0)
+    return True
+
+
+def _panel_susceptibility(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('susceptibility', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='χ = Var(||Ē||)', linewidth=1, color='navy')
+    ax.set_ylim(bottom=0, top=max(v) * 1.1 if max(v) > 0 else 1.0)
+    return True
+
+
+def _panel_corr_time(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('corr_time', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='τ_int(H)', linewidth=1, color='darkgreen')
+    ax.set_ylim(bottom=0, top=max(v) * 1.1 if max(v) > 0 else 1.0)
+    return True
+
+
+def _panel_entropy_rate(ax, history, steps):
+    s, v = _filter_valid_pairs(steps, history.get('entropy_rate', []))
+    if not v:
+        return False
+    ax.plot(s, v, label='dS/dt', linewidth=1, color='saddlebrown')
+    ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
+    return True
+
+
 _PANELS = [
-    ("Losses",                _panel_loss),
-    ("W Gradient Norm",       lambda a, h, s: _panel_positive_line(a, h, s, 'grad_W', '||∇W||')),
-    ("Energy Drift ΔH/H",     _panel_h_drift),
-    ("Force on E",            lambda a, h, s: _panel_positive_line(a, h, s, 'force_E', '||F_E||')),
-    ("Momentum Norm",         lambda a, h, s: _panel_positive_line(a, h, s, 'P_norm',  '||P||')),
-    ("Timestep dt",           _panel_dt),
-    ("Reversibility Residual", _panel_reversibility),
+    ("Losses",                  _panel_loss),
+    ("W Gradient Norm",         lambda a, h, s: _panel_positive_line(a, h, s, 'grad_W', '||∇W||')),
+    ("Energy Drift ΔH/H",       _panel_h_drift),
+    ("Force on E",              lambda a, h, s: _panel_positive_line(a, h, s, 'force_E', '||F_E||')),
+    ("Momentum Norm",           lambda a, h, s: _panel_positive_line(a, h, s, 'P_norm',  '||P||')),
+    ("Timestep dt",             _panel_dt),
+    ("Reversibility Residual",  _panel_reversibility),
+    ("Specific Heat",           _panel_specific_heat),
+    ("Susceptibility",          _panel_susceptibility),
+    ("Correlation Time τ_int",  _panel_corr_time),
+    ("Entropy Rate dS/dt",      _panel_entropy_rate),
 ]
 
 
@@ -236,8 +276,8 @@ def plot_training_history(history):
         plt.close(fig)
         return fig
 
-    fig, axes = plt.subplots(3, 3, figsize=(10, 8), constrained_layout=True)
-    fig.suptitle("Training Metrics", fontsize=12)
+    fig, axes = plt.subplots(4, 3, figsize=(11, 11), constrained_layout=True)
+    fig.suptitle("Training Metrics + Phase-Transition Telemetry", fontsize=12)
     steps = history.get('steps', [])
     flat_axes = axes.flatten()
 
@@ -291,6 +331,8 @@ def fetch_log_plot_history_update():
              'steps': [], 'train_l1': [], 'train_l2': [], 'test_l': [],
              'grad_W': [], 'force_E': [], 'P_norm': [],
              'H_drift': [], 'dt': [], 'reversibility': [],
+             'specific_heat': [], 'susceptibility': [],
+             'corr_time': [], 'entropy_rate': [],
          }
     try:
          fig = plot_training_history(history)

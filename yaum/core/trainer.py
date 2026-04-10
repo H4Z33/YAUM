@@ -27,6 +27,7 @@ from .diagnostics import measure_reversibility
 from .dynamics import make_rnn_force_fn, total_hamiltonian
 from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
 from .integrators import make_integrator
+from .observables import ObservableWindow, snapshot
 from .utils import device, get_batch
 
 
@@ -63,10 +64,17 @@ class Trainer:
             "H_drift": [],
             "dt": [],
             "reversibility": [],
+            "specific_heat": [],
+            "susceptibility": [],
+            "corr_time": [],
+            "entropy_rate": [],
         }
         self._eval_counter = 0
         self._energy_reference = None
         self._current_dt: float = float(config["dt"]) if "dt" in config else 0.01
+        self._observables = ObservableWindow(
+            size=int(config.get("observable_window", 32))
+        )
 
         self.run_id = f"run_{time.strftime('%Y%m%d-%H%M%S')}"
 
@@ -137,6 +145,7 @@ class Trainer:
         self._current_dt = float(self.config["dt"])
         if self.adaptive is not None:
             self.adaptive.dt = self._current_dt
+        self._observables.clear()
         print("Trainer setup complete.")
 
     def _run_reversibility_probe(self, x_batch, y_batch) -> float:
@@ -258,6 +267,8 @@ class Trainer:
                 self._energy_reference = energy
             h_drift = energy.drift(self._energy_reference)
 
+            self._observables.push(snapshot(self.E, H=energy.total))
+
             if self.adaptive is not None:
                 self._current_dt = self.adaptive.observe(h_drift)
 
@@ -279,6 +290,15 @@ class Trainer:
             else:
                 rev_residual = float("nan")
 
+            obs_report = self._observables.report()
+            if obs_report is not None:
+                c_v = obs_report.specific_heat
+                chi = obs_report.susceptibility
+                tau = obs_report.corr_time
+                s_rate = obs_report.entropy_rate
+            else:
+                c_v = chi = tau = s_rate = float("nan")
+
             self.train_losses_l1.append(loss_l1.item())
             self.train_losses_l2.append(loss_l2.item())
             self.test_losses.append(test_loss)
@@ -288,6 +308,10 @@ class Trainer:
             self.debug_stats["H_drift"].append(h_drift)
             self.debug_stats["dt"].append(self._current_dt)
             self.debug_stats["reversibility"].append(rev_residual)
+            self.debug_stats["specific_heat"].append(c_v)
+            self.debug_stats["susceptibility"].append(chi)
+            self.debug_stats["corr_time"].append(tau)
+            self.debug_stats["entropy_rate"].append(s_rate)
 
             elapsed = time.time() - start_time
             log_message = (
@@ -471,6 +495,8 @@ class Trainer:
                 "dt", [float(self.config.get("dt", 0.01))] * n
             )
             loaded_debug.setdefault("reversibility", [float("nan")] * n)
+            for key in ("specific_heat", "susceptibility", "corr_time", "entropy_rate"):
+                loaded_debug.setdefault(key, [float("nan")] * n)
             self.debug_stats = loaded_debug
             self.adaptive = self._build_adaptive_controller(self.config)
             self._current_dt = float(self.config["dt"])
@@ -478,6 +504,7 @@ class Trainer:
                 self.adaptive.dt = self._current_dt
             self.save_dir = os.path.dirname(filepath)
             self._energy_reference = None
+            self._observables.clear()
 
             print(f"Checkpoint loaded. Resuming from step {self.current_step}")
             return True
@@ -507,6 +534,10 @@ class Trainer:
             "H_drift": self.debug_stats.get("H_drift", []),
             "dt": self.debug_stats.get("dt", []),
             "reversibility": self.debug_stats.get("reversibility", []),
+            "specific_heat": self.debug_stats.get("specific_heat", []),
+            "susceptibility": self.debug_stats.get("susceptibility", []),
+            "corr_time": self.debug_stats.get("corr_time", []),
+            "entropy_rate": self.debug_stats.get("entropy_rate", []),
         }
 
     def generate(self, start_prompt, length, temperature):

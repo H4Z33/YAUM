@@ -199,6 +199,24 @@ def test_reversibility_disabled_by_default_records_nan(tmp_path):
     assert all(r != r for r in recorded)
 
 
+def test_phase_transition_observables_populate_history(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=6)
+    config["observable_window"] = 3
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    list(trainer.train())
+    history = trainer.get_history()
+    n = len(history["test_l"])
+    for key in ("specific_heat", "susceptibility", "corr_time", "entropy_rate"):
+        assert key in history
+        assert len(history[key]) == n
+    # At least one eval tick should have produced a finite number once the
+    # rolling window filled up.
+    assert any(v == v for v in history["specific_heat"])  # not all NaN
+    assert any(v == v for v in history["susceptibility"])
+
+
 def test_adaptive_dt_controller_wires_in_and_records_dt(tmp_path):
     torch.manual_seed(0)
     config = _tiny_config(tmp_path, num_steps=4)
