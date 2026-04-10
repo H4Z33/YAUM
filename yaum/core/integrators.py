@@ -190,9 +190,104 @@ _CORE_INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
     YoshidaIntegrator.name: YoshidaIntegrator,
 }
 
+
+class MultiScaleIntegrator(SymplecticIntegrator):
+    """rRESPA-style multi-time-step integrator. Turtles, literal.
+
+    Splits the potential into a cheap slow part and a costly fast part:
+
+        V(E) = V_fast(E) + V_slow(E)
+
+    * ``V_fast`` is whatever the caller passes through ``force_fn`` —
+      typically the model's data loss.
+    * ``V_slow`` is an analytical L2 prior ``0.5 * slow_lambda * ||E||^2``
+      whose force is just ``-slow_lambda * E`` — free to evaluate.
+
+    One outer step of size ``dt`` runs::
+
+        P += F_slow(E) * dt/2              # outer slow kick
+        for i in range(n_inner):
+            inner.step(E, P, dt / n_inner) # expensive fast propagator
+        P += F_slow(E) * dt/2              # outer slow kick
+
+    So the fast loss is evaluated ``O(n_inner)`` times per outer step
+    while the cheap regulariser is evaluated twice. With ``slow_lambda=0``
+    and ``n_inner=1`` this is exactly the inner integrator.
+    """
+
+    name = "multiscale"
+    order = 2
+
+    def __init__(
+        self,
+        inner: Union[str, "SymplecticIntegrator"] = "leapfrog",
+        n_inner: int = 4,
+        slow_lambda: float = 1e-3,
+    ):
+        if n_inner < 1:
+            raise ValueError("n_inner must be >= 1")
+        if slow_lambda < 0:
+            raise ValueError("slow_lambda must be >= 0")
+        self.n_inner = int(n_inner)
+        self.slow_lambda = float(slow_lambda)
+        if isinstance(inner, str):
+            if inner not in _CORE_INTEGRATORS:
+                raise ValueError(
+                    f"Unknown inner integrator {inner!r}. "
+                    f"Available: {sorted(_CORE_INTEGRATORS)}"
+                )
+            self.inner = _CORE_INTEGRATORS[inner]()
+        else:
+            self.inner = inner
+
+    def _slow_force(self, E: torch.Tensor) -> torch.Tensor:
+        """Force from V_slow = 0.5 * lambda * ||E||^2."""
+        if self.slow_lambda == 0.0:
+            return torch.zeros_like(E)
+        return -self.slow_lambda * E.detach()
+
+    def step(self, E, P, dt, force_fn, mass, retain_final=True):
+        half = dt * 0.5
+        P_cur = P + self._slow_force(E) * half
+
+        E_cur = E
+        sub_dt = dt / self.n_inner
+        loss_initial = None
+        loss_final = None
+        n_evals = 0
+        for i in range(self.n_inner):
+            is_last = i == self.n_inner - 1
+            sub = self.inner.step(
+                E_cur,
+                P_cur,
+                sub_dt,
+                force_fn,
+                mass,
+                retain_final=is_last and retain_final,
+            )
+            if i == 0:
+                loss_initial = sub.loss_initial
+            if is_last:
+                loss_final = sub.loss_final
+            E_cur = sub.E
+            P_cur = sub.P
+            n_evals += sub.n_force_evals
+
+        P_cur = P_cur + self._slow_force(E_cur) * half
+
+        return PhaseStep(
+            E=E_cur,
+            P=P_cur,
+            loss_initial=loss_initial,
+            loss_final=loss_final,
+            n_force_evals=n_evals,
+        )
+
+
 INTEGRATORS: dict[str, type[SymplecticIntegrator]] = {
     **_CORE_INTEGRATORS,
     LangevinIntegrator.name: LangevinIntegrator,
+    MultiScaleIntegrator.name: MultiScaleIntegrator,
 }
 
 

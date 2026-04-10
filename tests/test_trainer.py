@@ -119,6 +119,37 @@ def test_trainer_accepts_configured_integrator(tmp_path, name):
     assert trainer.integrator.name == name
 
 
+def test_trainer_runs_with_multiscale_integrator(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, integrator="multiscale", num_steps=2)
+    config["integrator_params"] = {
+        "inner": "leapfrog",
+        "n_inner": 3,
+        "slow_lambda": 1e-3,
+    }
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    events = list(trainer.train())
+    assert events[-1]["status"] == "finished"
+    assert trainer.integrator.name == "multiscale"
+    assert trainer.integrator.n_inner == 3
+
+
+def test_trainer_runs_with_langevin_thermostat(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, integrator="langevin", num_steps=2)
+    config["integrator_params"] = {
+        "friction": 0.5,
+        "temperature": 0.1,
+        "core": "leapfrog",
+    }
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    events = list(trainer.train())
+    assert events[-1]["status"] == "finished"
+    assert trainer.integrator.name == "langevin"
+
+
 def test_adaptive_dt_off_by_default(tmp_path):
     trainer = Trainer(_tiny_config(tmp_path))
     assert trainer.adaptive is None
