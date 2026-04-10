@@ -1,130 +1,151 @@
+"""Force fields and Hamiltonian observables for embedding dynamics.
+
+This module is the bridge between the neural network and the integrators in
+``yaum.core.integrators``. It exposes:
+
+* ``calculate_loss_and_grads_rnn`` — forward/backward through an RNN to
+  extract the gradient of the loss w.r.t. the input embedding tensor.
+* ``make_rnn_force_fn`` — turn that gradient into a closure usable by any
+  symplectic integrator.
+* ``kinetic_energy`` / ``total_hamiltonian`` — observables that let the
+  trainer monitor how well the integrator preserves the energy of the
+  embedding system.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 
-# --- Define device within this module or import from utils ---
+from .integrators import ForceField, LeapfrogIntegrator
+
 try:
     from .utils import device
-except ImportError:
-     if torch.cuda.is_available(): device = torch.device("cuda")
-     elif torch.backends.mps.is_available(): device = torch.device("mps")
-     else: device = torch.device("cpu")
-     print(f"(core/dynamics.py) Using device: {device}")
+except ImportError:  # pragma: no cover - device fallback
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
 
-# --- Loss and Grad Calculation (Adapted from Colab) ---
-def calculate_loss_and_grads_rnn(context_indices, target_indices, E_matrix, model, criterion, retain_graph=False):
-    """ Calculates loss and gradients w.r.t. input embeddings for RNN. """
-    # Assume model is already on the correct device
-    batch_size, seq_len = context_indices.shape
-    hidden = model.init_hidden(batch_size) # Initializes hidden state on correct device
+def calculate_loss_and_grads_rnn(
+    context_indices: torch.Tensor,
+    target_indices: torch.Tensor,
+    E_matrix: torch.Tensor,
+    model,
+    criterion,
+    retain_graph: bool = False,
+):
+    """Forward the RNN on embedded context and grab d(loss)/d(batch_embeddings).
 
-    # Ensure E_matrix requires grad if needed by caller
-    # E_matrix should be on the same device as the model
+    Returns ``(loss, embedding_grads, batch_embeddings)``. ``embedding_grads``
+    is ``None`` only if autograd raises — the caller decides how to handle it.
+    """
+    batch_size, _ = context_indices.shape
+    hidden = model.init_hidden(batch_size)
+
     batch_embeddings = F.embedding(context_indices, E_matrix)
-
     logits, _ = model(batch_embeddings, hidden)
     loss = criterion(logits.view(-1, model.vocab_size), target_indices.view(-1))
 
-    # Caller might need to zero E_matrix.grad before calling this if accumulating
-    # if E_matrix.grad is not None:
-    #     E_matrix.grad.zero_()
-
     try:
-        embedding_grads = torch.autograd.grad(
+        (embedding_grads,) = torch.autograd.grad(
             outputs=loss,
             inputs=batch_embeddings,
             grad_outputs=torch.ones_like(loss),
-            retain_graph=retain_graph
-        )[0]
-    except RuntimeError as e:
-        print(f"RuntimeError during autograd.grad: {e}")
-        print("Check if retain_graph=True was needed or if tensors were detached unexpectedly.")
-        # Return zero grads or raise? For now, return None to indicate failure.
+            retain_graph=retain_graph,
+        )
+    except RuntimeError as err:
+        print(f"autograd.grad failed: {err}")
         return loss, None, batch_embeddings
-
 
     return loss, embedding_grads, batch_embeddings
 
 
-# --- Hamiltonian Step (Adapted from Colab) ---
-def hamiltonian_step_rnn(context_indices, target_indices, E, P, model, criterion, mass_vector, dt):
-    """ Performs one step of Leapfrog integration for embeddings E and momenta P (RNN version). """
-    # Assume E, P, model, mass_vector are on the correct device
+def make_rnn_force_fn(
+    context_indices: torch.Tensor,
+    target_indices: torch.Tensor,
+    model,
+    criterion,
+) -> ForceField:
+    """Build a :class:`ForceField` that updates only the active tokens.
 
-    # Ensure E requires grad for the step
-    E_requires_grad_orig = E.requires_grad
-    E.requires_grad_(True)
+    The returned closure scatters the per-token-position gradient back into
+    a full ``(vocab_size, embedding_dim)`` force tensor. Token positions not
+    seen in this batch feel zero force, which is exactly what we want: they
+    stay on whatever trajectory they were on.
+    """
+    indices_flat = context_indices.reshape(-1)
 
-    active_indices_flat = context_indices.flatten().unique() # Find unique tokens in batch
+    def force_fn(E: torch.Tensor, *, retain_graph: bool):
+        E_in = E if E.requires_grad else E.detach().requires_grad_(True)
+        loss, grad_batch, _ = calculate_loss_and_grads_rnn(
+            context_indices,
+            target_indices,
+            E_in,
+            model,
+            criterion,
+            retain_graph=retain_graph,
+        )
+        if grad_batch is None:
+            raise RuntimeError("Gradient computation failed during force evaluation.")
+        force = torch.zeros_like(E_in)
+        force.index_add_(0, indices_flat, -grad_batch.reshape(-1, E_in.shape[1]))
+        return loss, force
 
-    # Use E directly if requires_grad=True, otherwise clone
-    # We need grad enabled for loss calculation, but updates happen out-of-place
-    E_current_for_grad = E # if E.requires_grad else E.clone().requires_grad_(True)
+    return force_fn
 
-    # --- Step 1: Calculate Force at time t ---
-    # Ensure E_current_for_grad has its grad zeroed if necessary (safer: do it here)
-    if E_current_for_grad.grad is not None:
-        E_current_for_grad.grad.zero_()
 
-    loss1, grad_V1, _ = calculate_loss_and_grads_rnn(
-        context_indices, target_indices, E_current_for_grad, model, criterion, retain_graph=False
+@dataclass
+class EnergyReport:
+    kinetic: float
+    potential: float
+    total: float
+
+    def drift(self, reference: "EnergyReport") -> float:
+        ref = abs(reference.total)
+        if ref < 1e-12:
+            return abs(self.total - reference.total)
+        return abs(self.total - reference.total) / ref
+
+
+def kinetic_energy(P: torch.Tensor, mass: torch.Tensor) -> torch.Tensor:
+    """T = sum(P^2 / (2 m)). ``mass`` broadcasts against ``P``."""
+    return (P * P / (2.0 * mass)).sum()
+
+
+def total_hamiltonian(
+    P: torch.Tensor, mass: torch.Tensor, potential: torch.Tensor
+) -> EnergyReport:
+    """Assemble (T, V, H) with V taken from the current loss value.
+
+    Treating the loss as potential energy is the defining move of this
+    project: the model's error field *is* the landscape the embeddings
+    roll through.
+    """
+    T = float(kinetic_energy(P, mass).detach())
+    V = float(potential.detach()) if torch.is_tensor(potential) else float(potential)
+    return EnergyReport(kinetic=T, potential=V, total=T + V)
+
+
+def hamiltonian_step_rnn(
+    context_indices,
+    target_indices,
+    E,
+    P,
+    model,
+    criterion,
+    mass_vector,
+    dt,
+):
+    """Backward-compatible leapfrog step. New code should use integrators directly."""
+    force_fn = make_rnn_force_fn(context_indices, target_indices, model, criterion)
+    E_leaf = E if E.requires_grad else E.detach().requires_grad_(True)
+    step = LeapfrogIntegrator().step(
+        E_leaf, P, dt, force_fn, mass_vector, retain_final=True
     )
-    if grad_V1 is None: # Handle potential autograd failure
-        print("Warning: grad_V1 calculation failed in Hamiltonian step. Skipping update.")
-        E.requires_grad_(E_requires_grad_orig) # Restore original grad setting
-        # Return state unchanged, perhaps with NaN loss to signal error?
-        return E, P, torch.tensor(float('nan')), torch.tensor(float('nan'))
-
-    # Use P.clone() to avoid modifying P in-place during calculation
-    P_current = P # Use reference, update will create P_new
-
-    # Accumulate force using index_add_
-    force_t_sparse = torch.zeros_like(P_current)
-    # Use reshape for safety with non-contiguous tensors
-    force_t_sparse.index_add_(0, context_indices.view(-1), -grad_V1.reshape(-1, E.shape[1]))
-
-    # --- Step 2: Update momenta half step ---
-    P_half = P_current + force_t_sparse * (dt / 2.0)
-
-    # --- Step 3: Update positions full step ---
-    # Calculate velocity only for active embeddings to potentially save computation
-    # However, indexing mass_vector might be slower than broadcast division if vocab is huge? Test needed.
-    # Simpler: Use broadcast division (assuming mass_vector is (vocab_size, 1))
-    # velocity_half = P_half / mass_vector # Requires mass_vector on correct device & shape
-
-    # Update using active indices for potentially better performance if batch << vocab_size
-    p_half_active = P_half[active_indices_flat]
-    m_active = mass_vector[active_indices_flat] # mass_vector should be (vocab_size, 1)
-    velocity_active = p_half_active / m_active
-
-    # Create E_new out-of-place
-    E_new_temp = E.clone().detach() # Start with current E values, detached
-    E_new_temp.index_add_(0, active_indices_flat, velocity_active * dt)
-    E_new_temp.requires_grad_(True) # Enable grad for the next loss calculation
-
-    # --- Step 4: Calculate Force at time t+dt ---
-    # Ensure grad is zeroed before calculation
-    if E_new_temp.grad is not None: E_new_temp.grad.zero_()
-
-    # *** CRITICAL: retain_graph=True for loss2 used in W update ***
-    loss2, grad_V2, _ = calculate_loss_and_grads_rnn(
-        context_indices, target_indices, E_new_temp, model, criterion, retain_graph=True
-    )
-
-    if grad_V2 is None:
-        print("Warning: grad_V2 calculation failed in Hamiltonian step. Using previous P.")
-        E.requires_grad_(E_requires_grad_orig)
-        # Return E_new but the old P, signal error in loss2?
-        return E_new_temp.detach().requires_grad_(E_requires_grad_orig), P, loss1.detach(), torch.tensor(float('nan'))
-
-
-    force_t_plus_dt_sparse = torch.zeros_like(P_current)
-    force_t_plus_dt_sparse.index_add_(0, context_indices.view(-1), -grad_V2.reshape(-1, E.shape[1]))
-
-    # --- Step 5: Update momenta full step ---
-    P_new = P_half + force_t_plus_dt_sparse * (dt / 2.0)
-
-    # Restore original requires_grad state for E before returning E_new
-    E_new_final = E_new_temp.detach().requires_grad_(E_requires_grad_orig)
-
-    return E_new_final, P_new.detach(), loss1.detach(), loss2 # loss2 still has graph attached
+    return step.E, step.P, step.loss_initial, step.loss_final

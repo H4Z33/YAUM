@@ -37,20 +37,25 @@ print(f"--- Device set to: {device} ---")
 print("-" * 50)
 
 
-# --- Batching Function (Adapt from Colab's get_batch) ---
 def get_batch(data, context_window, batch_size, target_device):
-    """Gets a random batch of context (x) and targets (y)."""
-    # Ensure data is a torch tensor
+    """Sample a batch of (context, next-token) windows uniformly at random.
+
+    Vectorised gather: build a (batch_size, context_window) index matrix and
+    index ``data`` once, instead of stacking ``batch_size`` Python slices.
+    """
     if not isinstance(data, torch.Tensor):
         data = torch.tensor(data, dtype=torch.long)
 
-    # Generate random starting indices for sequences in the batch
-    ix = torch.randint(len(data) - context_window, (batch_size,))
-    # Stack the sequences starting from these indices
-    x = torch.stack([data[i:i+context_window] for i in ix])
-    # The target for each position in the context is the next character
-    y = torch.stack([data[i+1:i+context_window+1] for i in ix])
-    # Use the passed target_device explicitly
-    return x.to(target_device), y.to(target_device)
+    max_start = len(data) - context_window - 1
+    if max_start <= 0:
+        raise ValueError(
+            f"Dataset too small: need at least context_window + 2 = "
+            f"{context_window + 2} tokens, got {len(data)}."
+        )
 
-# --- Add other utility functions if needed ---
+    starts = torch.randint(0, max_start + 1, (batch_size,))
+    offsets = torch.arange(context_window)
+    idx = starts.unsqueeze(1) + offsets.unsqueeze(0)
+    x = data[idx]
+    y = data[idx + 1]
+    return x.to(target_device, non_blocking=True), y.to(target_device, non_blocking=True)
