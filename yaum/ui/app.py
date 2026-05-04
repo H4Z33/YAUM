@@ -3,7 +3,6 @@ import sys
 import os
 import threading
 import time
-import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -13,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 # --- Imports from your project ---
 try:
-    from yaum.data.handling import load_and_split_data, calculate_mass_vector, save_vocab, load_vocab
+    from yaum.data.handling import load_and_split_data, calculate_mass_vector
     from yaum.core.trainer import Trainer
     from yaum.core.utils import device # Import device info
 except ImportError as e:
@@ -41,18 +40,30 @@ DEFAULT_CONFIG = {
     'data_file': '',
     'test_split_ratio': 0.1,
     'embedding_dim': 64,
-    'context_window': 200,
-    'hidden_dim': 512,
-    'n_layers': 3,
+    'context_window': 128,
+    'hidden_dim': 256,
+    'n_layers': 2,
     'dt': 0.01,
     'mass_type': 'frequency',
     'num_steps': 15000,
-    'batch_size': 64,
+    'batch_size': 32,
     'learning_rate_W': 0.001,
-    'eval_interval': 500,
+    'eval_interval': 1000,
+    'eval_iters': 20,
+    'eval_batch_size': 16,
     'gradient_clip_norm_W': 1.0,
+    'adaptive_dt': False,
+    'dt_min': 0.001,
+    'dt_max': 0.01,
+    'drift_high': 0.05,
+    'drift_low': 0.001,
     'results_dir': 'results', # Base directory for saving runs
     'checkpoint_to_load': None, # Path to a specific checkpoint
+    'step_delay': 0.001, # Delay between steps to keep system responsive (seconds)
+    'safe_speed': True, # Enable periodic CUDA synchronization to prevent TDR
+    'cuda_sync_interval': 1,
+    'cudnn_benchmark': False,
+    'disable_cudnn': False,
 }
 APP_STATE["config"] = DEFAULT_CONFIG.copy() # Initialize state with defaults
 
@@ -65,73 +76,60 @@ def append_to_log(message):
             APP_STATE["log_history"] = APP_STATE["log_history"][-100:]
         APP_STATE["latest_log"] = str(message)  # Also update latest_log for status display
 
-# --- File Browser Functions ---
-def browse_data_file():
-    """Opens a file browser and returns the selected file path"""
-    # Check if a training thread is active first
+# --- File Selection Functions ---
+def _selected_file_path(selection):
+    """Return a filesystem path from a Gradio file-selection payload."""
+    if not selection:
+        return ""
+    if isinstance(selection, (list, tuple)):
+        selection = selection[0] if selection else ""
+    if isinstance(selection, str):
+        return selection
+    return getattr(selection, "name", "") or getattr(selection, "path", "") or ""
+
+
+def select_data_file(selection):
+    """Apply a Gradio-selected data file to the path textbox and config."""
     if APP_STATE.get("thread_active"):
-        print("Cannot open file browser while training is active")
-        return APP_STATE["config"].get("data_file", "")
-        
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        
-        root = tk.Tk()
-        root.withdraw()  # Hide the main window
-        root.attributes('-topmost', True)  # Bring the dialog to the front
-        
-        file_path = filedialog.askopenfilename(
-            title="Select Data File",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        
-        # Update config if a file was selected
-        if file_path:
-            APP_STATE["config"]["data_file"] = file_path
-            return file_path
-        return APP_STATE["config"].get("data_file", "")
-    except Exception as e:
-        print(f"Error in file browser: {e}")
+        print("Cannot change data file while training is active.")
         return APP_STATE["config"].get("data_file", "")
 
-def browse_checkpoint_file():
-    """Opens a file browser and returns the selected checkpoint file path"""
-    # Check if a training thread is active first
+    file_path = _selected_file_path(selection)
+    if file_path:
+        APP_STATE["config"]["data_file"] = file_path
+        return file_path
+    return APP_STATE["config"].get("data_file", "")
+
+
+def select_checkpoint_file(selection):
+    """Apply a Gradio-selected checkpoint file to the checkpoint path textbox."""
     if APP_STATE.get("thread_active"):
-        print("Cannot open file browser while training is active")
+        print("Cannot change checkpoint file while training is active.")
         return ""
-        
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        
-        root = tk.Tk()
-        root.withdraw()  # Hide the main window
-        root.attributes('-topmost', True)  # Bring the dialog to the front
-        
-        file_path = filedialog.askopenfilename(
-            title="Select Checkpoint File",
-            filetypes=[("PyTorch Files", "*.pt"), ("All Files", "*.*")]
-        )
-        
-        # Just return the path, don't update config here
-        return file_path if file_path else ""
-    except Exception as e:
-        print(f"Error in file browser: {e}")
-        return ""
+
+    return _selected_file_path(selection)
 
 # --- UI Helper Functions ---
 def update_config_value(key, value):
     """Updates a single value in the global config state."""
     if value is not None:
          # Basic type casting for numerical inputs from Gradio
-         if key in ['embedding_dim', 'context_window', 'hidden_dim', 'n_layers', 'num_steps', 'batch_size', 'eval_interval']:
-             try: value = int(value)
-             except (ValueError, TypeError): value = DEFAULT_CONFIG.get(key) # Reset on error
-         elif key in ['test_split_ratio', 'dt', 'learning_rate_W', 'gradient_clip_norm_W']:
-             try: value = float(value)
-             except (ValueError, TypeError): value = DEFAULT_CONFIG.get(key) # Reset on error
+         if key in ['embedding_dim', 'context_window', 'hidden_dim', 'n_layers', 'num_steps', 'batch_size', 'eval_interval', 'eval_iters', 'eval_batch_size', 'cuda_sync_interval']:
+             try:
+                 value = int(value)
+             except (ValueError, TypeError):
+                 value = DEFAULT_CONFIG.get(key) # Reset on error
+         elif key in ['test_split_ratio', 'dt', 'learning_rate_W', 'gradient_clip_norm_W', 'step_delay', 'dt_min', 'dt_max', 'drift_high', 'drift_low']:
+             try:
+                 value = float(value)
+             except (ValueError, TypeError):
+                 value = DEFAULT_CONFIG.get(key) # Reset on error
+             if key in {'dt', 'dt_min', 'dt_max', 'drift_high'} and value <= 0:
+                 value = DEFAULT_CONFIG.get(key)
+             elif key == 'drift_low' and value < 0:
+                 value = DEFAULT_CONFIG.get(key)
+         elif key in ['safe_speed', 'adaptive_dt', 'cudnn_benchmark', 'disable_cudnn']:
+             value = bool(value)
          APP_STATE["config"][key] = value
     # Return the possibly updated value to the UI component
     return APP_STATE["config"].get(key, DEFAULT_CONFIG.get(key))
@@ -171,8 +169,10 @@ def _panel_loss(ax, history, steps):
     s_te, v_te = _filter_valid_pairs(steps, history.get('test_l', []))
     if not v_te:
         return False
-    if v_l1: ax.plot(s_l1, v_l1, label='L1', alpha=0.7, linewidth=1)
-    if v_l2: ax.plot(s_l2, v_l2, label='L2->W', alpha=0.7, linewidth=1)
+    if v_l1:
+        ax.plot(s_l1, v_l1, label='L1', alpha=0.7, linewidth=1)
+    if v_l2:
+        ax.plot(s_l2, v_l2, label='L2->W', alpha=0.7, linewidth=1)
     ax.plot(s_te, v_te, label='Test', linewidth=1.5, color='red')
     lo, hi = min(v_te) * 0.9, min(max(v_te) * 1.1, min(v_te) * 20)
     ax.set_ylim(bottom=lo, top=hi)
@@ -193,7 +193,7 @@ def _panel_h_drift(ax, history, steps):
     s, v = _filter_valid_pairs(steps, history.get('H_drift', []))
     if not v:
         return False
-    ax.plot(s, v, label='ΔH/H', linewidth=1, color='purple')
+    ax.plot(s, v, label='Î”H/H', linewidth=1, color='purple')
     ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
     return True
 
@@ -229,7 +229,7 @@ def _panel_susceptibility(ax, history, steps):
     s, v = _filter_valid_pairs(steps, history.get('susceptibility', []))
     if not v:
         return False
-    ax.plot(s, v, label='χ = Var(||Ē||)', linewidth=1, color='navy')
+    ax.plot(s, v, label='Ï‡ = Var(||Ä’||)', linewidth=1, color='navy')
     ax.set_ylim(bottom=0, top=max(v) * 1.1 if max(v) > 0 else 1.0)
     return True
 
@@ -238,7 +238,7 @@ def _panel_corr_time(ax, history, steps):
     s, v = _filter_valid_pairs(steps, history.get('corr_time', []))
     if not v:
         return False
-    ax.plot(s, v, label='τ_int(H)', linewidth=1, color='darkgreen')
+    ax.plot(s, v, label='Ï„_int(H)', linewidth=1, color='darkgreen')
     ax.set_ylim(bottom=0, top=max(v) * 1.1 if max(v) > 0 else 1.0)
     return True
 
@@ -256,7 +256,7 @@ def _panel_action(ax, history, steps):
     s, v = _filter_valid_pairs(steps, history.get('action', []))
     if not v:
         return False
-    ax.plot(s, v, label='S = ∫L dt', linewidth=1, color='indigo')
+    ax.plot(s, v, label='S = âˆ«L dt', linewidth=1, color='indigo')
     ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
     return True
 
@@ -265,25 +265,25 @@ def _panel_lagrangian(ax, history, steps):
     s, v = _filter_valid_pairs(steps, history.get('lagrangian', []))
     if not v:
         return False
-    ax.plot(s, v, label='L = T − V', linewidth=1, color='darkslategrey')
+    ax.plot(s, v, label='L = T âˆ’ V', linewidth=1, color='darkslategrey')
     ax.axhline(0.0, color='grey', linestyle=':', linewidth=0.8)
     return True
 
 
 _PANELS = [
     ("Losses",                  _panel_loss),
-    ("W Gradient Norm",         lambda a, h, s: _panel_positive_line(a, h, s, 'grad_W', '||∇W||')),
-    ("Energy Drift ΔH/H",       _panel_h_drift),
+    ("W Gradient Norm",         lambda a, h, s: _panel_positive_line(a, h, s, 'grad_W', '||âˆ‡W||')),
+    ("Energy Drift Î”H/H",       _panel_h_drift),
     ("Force on E",              lambda a, h, s: _panel_positive_line(a, h, s, 'force_E', '||F_E||')),
     ("Momentum Norm",           lambda a, h, s: _panel_positive_line(a, h, s, 'P_norm',  '||P||')),
     ("Timestep dt",             _panel_dt),
     ("Reversibility Residual",  _panel_reversibility),
     ("Specific Heat",           _panel_specific_heat),
     ("Susceptibility",          _panel_susceptibility),
-    ("Correlation Time τ_int",  _panel_corr_time),
+    ("Correlation Time Ï„_int",  _panel_corr_time),
     ("Entropy Rate dS/dt",      _panel_entropy_rate),
-    ("Action S = ∫L dt",        _panel_action),
-    ("Lagrangian L = T − V",    _panel_lagrangian),
+    ("Action S = âˆ«L dt",        _panel_action),
+    ("Lagrangian L = T âˆ’ V",    _panel_lagrangian),
 ]
 
 
@@ -380,20 +380,20 @@ def update_ui_periodically():
                 progress = f"Training: {current_step}/{max_steps} steps ({(current_step/max_steps*100):.1f}%)"
             else:
                 progress = f"Training: {current_step} steps"
-        except:
+        except Exception:
             progress = "Training in progress..."
     else:
         if APP_STATE.get("model_ready"):
             progress = "Model ready"
         else:
             progress = "Model not prepared"
-    
+
     return log_history, fig, history, progress
 
 # --- UI Update Loop Generators ---
 def refresh_ui():
     """Generator that periodically refreshes the UI."""
-    poll_interval = 1
+    poll_interval = 3
     last_update_time = 0
     while True:
         current_time = time.time()
@@ -418,17 +418,17 @@ def prepare_data_and_model(config_dict_state):
     # Check if training is active first
     if APP_STATE.get("thread_active"):
         return update_status("Please stop training before preparing new data/model.")
-        
+
     # Make a copy of the config to avoid modifying the original
     config = config_dict_state.copy() if config_dict_state else APP_STATE["config"].copy()
-    
+
     # Rest of function remains the same...
     # Ensure we're using the most up-to-date file path from APP_STATE
     config['data_file'] = APP_STATE["config"].get('data_file', '')
-    
+
     filepath = config.get('data_file')
     print(f"Preparing with file path: {filepath}")
-    
+
     if not filepath:
         return update_status("Error: Data file path is required.")
     if not os.path.exists(filepath):
@@ -482,7 +482,7 @@ def run_training_background():
     print("Training thread started...")
     append_to_log("Training thread started...")
     APP_STATE["thread_active"] = True
-    
+
     try:
          # Consume the generator from trainer.train()
          for update in trainer.train():
@@ -493,7 +493,7 @@ def run_training_background():
              if trainer._stop_training_flag:
                  print("Training thread: Stop flag detected.")
                  break
-                 
+
          # Update status after loop finishes/breaks
          if trainer._stop_training_flag:
              append_to_log(f"Training stopped at step {trainer.current_step}.")
@@ -501,14 +501,14 @@ def run_training_background():
          else:
              append_to_log(f"Training finished at step {trainer.current_step}.")
              print("Training thread finished (completed).")
-             
+
     except Exception as e:
          print(f"Exception in training thread: {e}")
          import traceback
          traceback.print_exc()
          append_to_log(f"Training Error: {e}")
          APP_STATE["model_ready"] = False  # Mark as not ready after error
-         
+
     finally:
         # This section ALWAYS runs, even if there's an exception or return above
         APP_STATE["thread_active"] = False  # Mark thread as inactive
@@ -545,20 +545,20 @@ def stop_training_ui():
     """Signals the training thread to stop and waits for clean termination."""
     trainer = APP_STATE.get("trainer")
     thread = APP_STATE.get("training_thread")
-    
+
     if trainer and APP_STATE.get("thread_active") and thread:
         status_msg = "Requesting training stop..."
         print(status_msg)
         trainer.stop_training()  # Set the flag
-        
+
         # Give a reasonable timeout for the thread to gracefully terminate
         timeout_seconds = 5.0
         start_time = time.time()
-        
+
         # Use a non-blocking approach to wait for thread termination
         while thread.is_alive() and (time.time() - start_time) < timeout_seconds:
             time.sleep(0.1)  # Short sleep to avoid busy waiting
-        
+
         # If thread is still running after timeout, it may be stuck
         if thread.is_alive():
             append_to_log("Warning: Training thread taking longer than expected to stop.")
@@ -567,8 +567,8 @@ def stop_training_ui():
             APP_STATE["thread_active"] = False
         else:
             append_to_log(f"Training stopped at step {trainer.current_step if hasattr(trainer, 'current_step') else 'unknown'}.")
-        
-        return update_status(f"Training stopped. You can now use other functions.")
+
+        return update_status("Training stopped. You can now use other functions.")
     else:
         return update_status("Training is not currently running.")
 
@@ -585,7 +585,7 @@ def run_inference(prompt, length, temperature):
     try:
         # Ensure model components are on the correct device before inference
         trainer.model.to(device)
-        if hasattr(trainer, 'E') and trainer.E is not None: 
+        if hasattr(trainer, 'E') and trainer.E is not None:
             trainer.E = trainer.E.to(device)
 
         length = int(length)
@@ -608,20 +608,22 @@ def restore_default_config():
     """Restores the default configuration values."""
     # Copy the default config to the app state
     APP_STATE["config"] = DEFAULT_CONFIG.copy()
-    
+
     # Get all the default values to update UI
     output_component_keys = [
         'data_file', 'test_split_ratio', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
         'dt', 'mass_type', 'num_steps', 'batch_size', 'learning_rate_W',
-        'eval_interval', 'gradient_clip_norm_W'
+        'eval_interval', 'eval_iters', 'eval_batch_size', 'gradient_clip_norm_W',
+        'adaptive_dt', 'dt_min', 'dt_max', 'drift_high', 'drift_low',
+        'step_delay', 'safe_speed', 'cudnn_benchmark', 'disable_cudnn'
     ]
-    
+
     default_values = [DEFAULT_CONFIG.get(key, "") for key in output_component_keys]
-    
+
     # Add status message at the beginning
     status_msg = "Configuration restored to defaults."
     append_to_log(status_msg)
-    
+
     return [status_msg] + default_values
 
 # --- Checkpoint Loading ---
@@ -631,15 +633,17 @@ def load_checkpoint_ui(filepath):
     output_component_keys = [
         'data_file', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
         'dt', 'mass_type', 'num_steps', 'batch_size', 'learning_rate_W',
-        'eval_interval', 'gradient_clip_norm_W'
+        'eval_interval', 'eval_iters', 'eval_batch_size', 'gradient_clip_norm_W',
+        'adaptive_dt', 'dt_min', 'dt_max', 'drift_high', 'drift_low',
+        'step_delay', 'safe_speed', 'cudnn_benchmark', 'disable_cudnn'
     ]
-    
+
     # Check if training is active first
     if APP_STATE.get("thread_active"):
         status_msg = "Please stop training before loading a checkpoint."
         config_vals = get_config_values(*output_component_keys)
         return [update_status(status_msg)] + config_vals
-        
+
     if not filepath or not os.path.exists(filepath):
         status_msg = f"Error: Checkpoint file not found: {filepath}"
         # Return status + current config values
@@ -651,25 +655,25 @@ def load_checkpoint_ui(filepath):
         if APP_STATE.get("thread_active"):
              stop_training_ui()
              time.sleep(0.5) # Give thread a moment
-        
+
         append_to_log(f"Loading checkpoint from {filepath}...")
         print(f"Attempting to load checkpoint: {filepath}")
-        
+
         # First, try to load the checkpoint to extract the configuration
         import torch
-        checkpoint = torch.load(filepath, map_location=device)
-        
+        checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
+
         # Check if the checkpoint contains configuration
         if 'config' in checkpoint:
             # Get the configuration from the checkpoint
             stored_config = checkpoint['config']
             append_to_log("Found configuration in checkpoint, restoring settings...")
-            
+
             # Update the global config with values from the checkpoint
             for key in stored_config:
                 if key in APP_STATE["config"]:
                     APP_STATE["config"][key] = stored_config[key]
-            
+
             # Make sure critical architecture parameters are definitely set
             if 'embedding_dim' in stored_config:
                 APP_STATE["config"]['embedding_dim'] = stored_config['embedding_dim']
@@ -677,27 +681,50 @@ def load_checkpoint_ui(filepath):
                 APP_STATE["config"]['hidden_dim'] = stored_config['hidden_dim']
             if 'n_layers' in stored_config:
                 APP_STATE["config"]['n_layers'] = stored_config['n_layers']
-            
+
             append_to_log(f"Restored configuration from checkpoint: hidden_dim={APP_STATE['config']['hidden_dim']}, n_layers={APP_STATE['config']['n_layers']}")
         else:
             append_to_log("Warning: Checkpoint does not contain configuration. Using current settings which may cause mismatch errors.")
-        
+
         # Now create a new Trainer with the updated config
         APP_STATE["trainer"] = Trainer(APP_STATE["config"].copy())
-        
+
         # Load the checkpoint into the trainer
         loaded_ok = APP_STATE["trainer"].load_checkpoint(filepath)
 
         if loaded_ok:
             # Ensure the APP_STATE config is fully updated from the trainer
             APP_STATE["config"] = APP_STATE["trainer"].config.copy()
-            APP_STATE["data_loaded"] = True
+
+            # --- IMPORTANT: Re-load the data if a file path exists ---
+            # Resuming from a checkpoint requires the training data to be loaded
+            # so the trainer can sample batches.
+            data_path = APP_STATE["config"].get("data_file")
+            if data_path and os.path.exists(data_path):
+                try:
+                    append_to_log(f"Loading data from {data_path} to support training resume...")
+                    train_data, test_data, char_to_idx, idx_to_char, vocab_size = load_and_split_data(
+                        data_path, APP_STATE["config"].get('test_split_ratio', 0.1)
+                    )
+                    mass_vector = calculate_mass_vector(
+                        train_data, vocab_size, APP_STATE["config"].get('mass_type', 'frequency'), device
+                    )
+                    # Bind the data back to the trainer
+                    APP_STATE["trainer"].setup(
+                        train_data, test_data, char_to_idx, idx_to_char, vocab_size, mass_vector
+                    )
+                    # Re-load the checkpoint state because setup() overwrites E and P
+                    APP_STATE["trainer"].load_checkpoint(filepath)
+                    APP_STATE["data_loaded"] = True
+                except Exception as de:
+                    append_to_log(f"Warning: Could not load data file {data_path}: {de}")
+
             APP_STATE["model_ready"] = True
-            
+
             status_msg = f"Checkpoint loaded successfully. Model ready at step: {APP_STATE['trainer'].current_step}"
             append_to_log(status_msg)
             print(status_msg)
-            
+
             # Fetch the newly loaded config values to update UI
             config_vals = get_config_values(*output_component_keys)
             # Update the history state as well
@@ -737,7 +764,7 @@ footer { display: none !important; }
 
 def create_ui():
     demo = gr.Blocks(css=css, title="YAUM - Hamiltonian LLM Trainer")
-    
+
     with demo:
         gr.Markdown("# YAUM - Hamiltonian LLM Trainer")
         gr.Markdown("Configure, train, and test LLMs using Hamiltonian-inspired dynamics.")
@@ -751,13 +778,21 @@ def create_ui():
                     # Left Column - Data & Architecture
                     with gr.Column(scale=1):
                         gr.Markdown("### Data & Checkpoint")
-                        with gr.Row():
-                            data_file_input = gr.Textbox(label="Data File Path (.txt)", value=DEFAULT_CONFIG['data_file'], elem_classes="gr-input", scale=3)
-                            data_file_button = gr.Button("Browse", elem_classes="gr-button", scale=1)
-                        
-                        with gr.Row():
-                            load_checkpoint_input = gr.Textbox(label="Load Checkpoint Path (.pt)", placeholder="Optional: Path to resume/load", elem_classes="gr-input", scale=3)
-                            checkpoint_file_button = gr.Button("Browse", elem_classes="gr-button", scale=1)
+                        data_file_input = gr.Textbox(label="Data File Path (.txt)", value=DEFAULT_CONFIG['data_file'], elem_classes="gr-input")
+                        data_file_picker = gr.File(
+                            label="Choose Data File",
+                            file_count="single",
+                            file_types=[".txt"],
+                            type="filepath",
+                        )
+
+                        load_checkpoint_input = gr.Textbox(label="Load Checkpoint Path (.pt)", placeholder="Optional: Path to resume/load", elem_classes="gr-input")
+                        checkpoint_file_picker = gr.File(
+                            label="Choose Checkpoint",
+                            file_count="single",
+                            file_types=[".pt"],
+                            type="filepath",
+                        )
 
                         with gr.Row():
                             clear_checkpoint_button = gr.Button("Clear Checkpoint", elem_classes="gr-button", scale=1)
@@ -776,13 +811,26 @@ def create_ui():
                         gr.Markdown("### Hamiltonian Dynamics")
                         dt_input = gr.Number(label="dt (Time Step)", value=DEFAULT_CONFIG['dt'], minimum=0.0001, step=0.001, elem_classes="gr-input")
                         mass_type_input = gr.Dropdown(label="Mass Type", choices=["uniform", "frequency", "inverse_frequency"], value=DEFAULT_CONFIG['mass_type'], elem_classes="gr-input")
+                        adaptive_dt_input = gr.Checkbox(label="Adaptive dt", value=DEFAULT_CONFIG['adaptive_dt'], info="Shrink dt when Hamiltonian drift rises.")
+                        with gr.Row():
+                            dt_min_input = gr.Number(label="dt Min", value=DEFAULT_CONFIG['dt_min'], minimum=0.0, step=0.0005, elem_classes="gr-input")
+                            dt_max_input = gr.Number(label="dt Max", value=DEFAULT_CONFIG['dt_max'], minimum=0.0, step=0.001, elem_classes="gr-input")
+                        with gr.Row():
+                            drift_high_input = gr.Number(label="Drift High", value=DEFAULT_CONFIG['drift_high'], minimum=0.0, step=0.005, elem_classes="gr-input")
+                            drift_low_input = gr.Number(label="Drift Low", value=DEFAULT_CONFIG['drift_low'], minimum=0.0, step=0.0005, elem_classes="gr-input")
 
                         gr.Markdown("### Training Parameters")
                         num_steps_input = gr.Number(label="Num Steps", value=DEFAULT_CONFIG['num_steps'], precision=0, step=1000, elem_classes="gr-input")
                         batch_size_input = gr.Number(label="Batch Size", value=DEFAULT_CONFIG['batch_size'], precision=0, step=8, elem_classes="gr-input")
                         learning_rate_W_input = gr.Number(label="Adam LR (W)", value=DEFAULT_CONFIG['learning_rate_W'], minimum=1e-6, step=1e-4, elem_classes="gr-input")
                         eval_interval_input = gr.Number(label="Eval Interval (steps)", value=DEFAULT_CONFIG['eval_interval'], precision=0, step=100, elem_classes="gr-input")
+                        eval_iters_input = gr.Number(label="Eval Iters", value=DEFAULT_CONFIG['eval_iters'], precision=0, step=5, elem_classes="gr-input")
+                        eval_batch_size_input = gr.Number(label="Eval Batch Size", value=DEFAULT_CONFIG['eval_batch_size'], precision=0, step=8, elem_classes="gr-input")
                         gradient_clip_norm_W_input = gr.Number(label="Grad Clip Norm (W)", value=DEFAULT_CONFIG['gradient_clip_norm_W'], minimum=0.1, step=0.1, elem_classes="gr-input")
+                        step_delay_input = gr.Slider(label="System Throttle (Step Delay)", minimum=0.0, maximum=0.1, step=0.001, value=DEFAULT_CONFIG['step_delay'], info="Tiny delay between steps to keep UI/OS responsive.")
+                        safe_speed_input = gr.Checkbox(label="Safe-Speed Mode", value=DEFAULT_CONFIG['safe_speed'], info="Synchronize GPU periodically to prevent driver crashes (TDR).")
+                        cudnn_benchmark_input = gr.Checkbox(label="cuDNN Benchmark", value=DEFAULT_CONFIG['cudnn_benchmark'], info="Faster after autotune, riskier on Windows display GPUs.")
+                        disable_cudnn_input = gr.Checkbox(label="Disable cuDNN", value=DEFAULT_CONFIG['disable_cudnn'], info="Diagnostic fallback if the NVIDIA driver resets.")
 
                 # Button Row
                 with gr.Row():
@@ -795,23 +843,22 @@ def create_ui():
                     status_textbox,
                     data_file_input, embedding_dim_input, context_window_input, hidden_dim_input, n_layers_input,
                     dt_input, mass_type_input, num_steps_input, batch_size_input, learning_rate_W_input,
-                    eval_interval_input, gradient_clip_norm_W_input
+                    eval_interval_input, eval_iters_input, eval_batch_size_input, gradient_clip_norm_W_input,
+                    adaptive_dt_input, dt_min_input, dt_max_input, drift_high_input, drift_low_input,
+                    step_delay_input, safe_speed_input, cudnn_benchmark_input, disable_cudnn_input
                 ]
 
                 # --- Attach callbacks ---
-                # Use gr.State to pass the whole config dict correctly
-                config_state = gr.State(value=APP_STATE["config"])
-                
                 # Make the prepare button always use the latest APP_STATE["config"]
                 prepare_button.click(
-                    lambda: prepare_data_and_model(APP_STATE["config"]), 
-                    inputs=None, 
+                    lambda: prepare_data_and_model(APP_STATE["config"]),
+                    inputs=None,
                     outputs=[status_textbox]
                 )
-                
+
                 load_checkpoint_button.click(
-                    load_checkpoint_ui, 
-                    inputs=[load_checkpoint_input], 
+                    load_checkpoint_ui,
+                    inputs=[load_checkpoint_input],
                     outputs=config_output_components_for_load
                 )
 
@@ -826,9 +873,12 @@ def create_ui():
                 # Define all components that should be updated with defaults
                 restore_defaults_components = [
                     status_textbox,
-                    data_file_input, test_split_ratio_input, embedding_dim_input, context_window_input, 
-                    hidden_dim_input, n_layers_input, dt_input, mass_type_input, num_steps_input, 
-                    batch_size_input, learning_rate_W_input, eval_interval_input, gradient_clip_norm_W_input
+                    data_file_input, test_split_ratio_input, embedding_dim_input, context_window_input,
+                    hidden_dim_input, n_layers_input, dt_input, mass_type_input, num_steps_input,
+                    batch_size_input, learning_rate_W_input, eval_interval_input, eval_iters_input,
+                    eval_batch_size_input, gradient_clip_norm_W_input, adaptive_dt_input,
+                    dt_min_input, dt_max_input, drift_high_input, drift_low_input,
+                    step_delay_input, safe_speed_input, cudnn_benchmark_input, disable_cudnn_input
                 ]
 
                 restore_defaults_button.click(
@@ -836,13 +886,13 @@ def create_ui():
                     inputs=[],
                     outputs=restore_defaults_components
                 )
-                
-                # File browser button callbacks
-                data_file_button.click(browse_data_file, inputs=[], outputs=[data_file_input])
-                checkpoint_file_button.click(browse_checkpoint_file, inputs=[], outputs=[load_checkpoint_input])
+
+                # Browser-native file selection callbacks.
+                data_file_picker.change(select_data_file, inputs=[data_file_picker], outputs=[data_file_input])
+                checkpoint_file_picker.change(select_checkpoint_file, inputs=[checkpoint_file_picker], outputs=[load_checkpoint_input])
 
                 # Attach .change listeners AFTER components are defined to update APP_STATE config
-                data_file_input.change(lambda x: update_config_value('data_file', x), inputs=data_file_input, outputs=data_file_input) 
+                data_file_input.change(lambda x: update_config_value('data_file', x), inputs=data_file_input, outputs=data_file_input)
                 test_split_ratio_input.change(lambda x: update_config_value('test_split_ratio', x), inputs=test_split_ratio_input, outputs=test_split_ratio_input)
                 embedding_dim_input.change(lambda x: update_config_value('embedding_dim', x), inputs=embedding_dim_input, outputs=embedding_dim_input)
                 context_window_input.change(lambda x: update_config_value('context_window', x), inputs=context_window_input, outputs=context_window_input)
@@ -850,18 +900,29 @@ def create_ui():
                 n_layers_input.change(lambda x: update_config_value('n_layers', x), inputs=n_layers_input, outputs=n_layers_input)
                 dt_input.change(lambda x: update_config_value('dt', x), inputs=dt_input, outputs=dt_input)
                 mass_type_input.change(lambda x: update_config_value('mass_type', x), inputs=mass_type_input, outputs=mass_type_input)
+                adaptive_dt_input.change(lambda x: update_config_value('adaptive_dt', x), inputs=adaptive_dt_input, outputs=adaptive_dt_input)
+                dt_min_input.change(lambda x: update_config_value('dt_min', x), inputs=dt_min_input, outputs=dt_min_input)
+                dt_max_input.change(lambda x: update_config_value('dt_max', x), inputs=dt_max_input, outputs=dt_max_input)
+                drift_high_input.change(lambda x: update_config_value('drift_high', x), inputs=drift_high_input, outputs=drift_high_input)
+                drift_low_input.change(lambda x: update_config_value('drift_low', x), inputs=drift_low_input, outputs=drift_low_input)
                 num_steps_input.change(lambda x: update_config_value('num_steps', x), inputs=num_steps_input, outputs=num_steps_input)
                 batch_size_input.change(lambda x: update_config_value('batch_size', x), inputs=batch_size_input, outputs=batch_size_input)
                 learning_rate_W_input.change(lambda x: update_config_value('learning_rate_W', x), inputs=learning_rate_W_input, outputs=learning_rate_W_input)
                 eval_interval_input.change(lambda x: update_config_value('eval_interval', x), inputs=eval_interval_input, outputs=eval_interval_input)
+                eval_iters_input.change(lambda x: update_config_value('eval_iters', x), inputs=eval_iters_input, outputs=eval_iters_input)
+                eval_batch_size_input.change(lambda x: update_config_value('eval_batch_size', x), inputs=eval_batch_size_input, outputs=eval_batch_size_input)
                 gradient_clip_norm_W_input.change(lambda x: update_config_value('gradient_clip_norm_W', x), inputs=gradient_clip_norm_W_input, outputs=gradient_clip_norm_W_input)
+                step_delay_input.change(lambda x: update_config_value('step_delay', x), inputs=step_delay_input, outputs=step_delay_input)
+                safe_speed_input.change(lambda x: update_config_value('safe_speed', x), inputs=safe_speed_input, outputs=safe_speed_input)
+                cudnn_benchmark_input.change(lambda x: update_config_value('cudnn_benchmark', x), inputs=cudnn_benchmark_input, outputs=cudnn_benchmark_input)
+                disable_cudnn_input.change(lambda x: update_config_value('disable_cudnn', x), inputs=disable_cudnn_input, outputs=disable_cudnn_input)
 
             # Training Tab
             with gr.TabItem("Training"):
                 with gr.Row():
                     start_button = gr.Button("Start Training", variant="primary", elem_classes="gr-button")
                     stop_button = gr.Button("Stop Training", elem_classes="gr-button gr-button-stop")
-                
+
                 # Progress as a text display instead of progress bar component
                 progress_text = gr.Textbox(label="Progress", value="Model not prepared", interactive=False)
                 training_log_output = gr.Textbox(label="Training Log", lines=10, interactive=False, max_lines=20, elem_classes="gr-output")
@@ -870,7 +931,7 @@ def create_ui():
 
                 # --- Define outputs for the refresh UI function ---
                 ui_refresh_outputs = [training_log_output, plot_output, history_state, progress_text]
-                
+
                 # --- Setup UI refresh loop ---
                 demo.load(
                     refresh_ui,
@@ -903,4 +964,4 @@ if __name__ == "__main__":
     demo = create_ui()
     # Enable queue for smoother handling of multiple requests/updates
     demo.queue()
-    demo.launch(share=False) # set share=True for public link if needed
+    demo.launch(share=True) # set share=True for public link if needed

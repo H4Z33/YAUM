@@ -18,8 +18,11 @@
 #    pip install -r requirements.txt
 # ---------------------------------
 
-# --- Core Dependencies (Pinned from pip freeze) ---
-torch==2.6.0       # Base version, see install instructions above.
+# --- Core Dependencies (Pinned for CUDA 12.4) ---
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
 numpy==2.2.4
 gradio==5.23.3     # UI Framework
 matplotlib==3.10.1 # For plotting training curves
@@ -61,7 +64,7 @@ mdurl==0.1.2        # Dependency of markdown-it-py
 orjson==3.10.16     # Fast JSON library (used by Gradio/FastAPI)
 packaging==24.2     # Core Python packaging utility
 pandas==2.2.3       # Data analysis library (potentially used by Gradio for tables?)
-pillow==11.1.1      # Image processing (likely Matplotlib/Gradio dependency)
+pillow==11.1.0      # Image processing (likely Matplotlib/Gradio dependency)
 pydantic==2.11.2    # Data validation (used heavily by FastAPI/Gradio)
 pydantic_core==2.33.1 # Core component of Pydantic
 pydub==0.25.1       # Audio manipulation (likely Gradio dependency)
@@ -90,3 +93,5 @@ tzdata==2025.2      # Timezone data dependency
 urllib3==2.3.0      # HTTP library dependency
 uvicorn==0.34.0     # ASGI server (used by Gradio/FastAPI)
 websockets==15.0.1  # WebSocket library (used by Gradio)
+pytest==8.3.3       # For running tests
+ruff==0.15.12       # Linter/Formatter

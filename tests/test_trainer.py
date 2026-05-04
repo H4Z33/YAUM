@@ -1,7 +1,7 @@
 """Trainer integration spec.
 
 These run a tiny model end-to-end on synthetic data. They don't prove the
-physics — that's what test_integrators and test_dynamics do — but they
+physics â€” that's what test_integrators and test_dynamics do â€” but they
 verify the plumbing: setup, training yields, evaluation, checkpoint
 round-trip, generation, and integrator selection.
 """
@@ -31,6 +31,7 @@ def _tiny_config(tmp_path, integrator="leapfrog", num_steps=4):
         "eval_batch_size": 2,
         "results_dir": str(tmp_path),
         "integrator": integrator,
+        "safe_speed": False,
     }
 
 
@@ -51,6 +52,36 @@ def test_trainer_setup_instantiates_state(tmp_path):
     assert trainer.E.shape == (8, 4)
     assert trainer.P.shape == (8, 4)
     assert trainer.integrator.name == "leapfrog"
+
+
+def test_trainer_keeps_corpus_tensors_on_cpu(tmp_path):
+    trainer = Trainer(_tiny_config(tmp_path))
+    _tiny_setup(trainer)
+    assert trainer.train_data.device.type == "cpu"
+    assert trainer.test_data.device.type == "cpu"
+
+
+def test_train_loop_commits_phase_state_on_non_eval_steps(tmp_path):
+    config = _tiny_config(tmp_path, num_steps=3)
+    config["eval_interval"] = 3
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    E0 = trainer.E.detach().clone()
+    P0 = trainer.P.detach().clone()
+
+    def fake_step_embeddings(_x_batch, _y_batch):
+        loss_l1 = torch.tensor(1.0, device=trainer.E.device)
+        loss_l2 = torch.tensor(1.0, device=trainer.E.device, requires_grad=True)
+        return trainer.E.detach() + 1.0, trainer.P.detach() + 1.0, loss_l1, loss_l2
+
+    trainer._step_embeddings = fake_step_embeddings
+    events = list(trainer.train())
+
+    assert events[-1]["status"] == "finished"
+    assert trainer.current_step == 3
+    assert torch.allclose(trainer.E.detach(), E0 + 3.0)
+    assert torch.allclose(trainer.P, P0 + 3.0)
+    assert len(trainer.test_losses) == 1
 
 
 def test_train_loop_yields_running_and_finished(tmp_path):

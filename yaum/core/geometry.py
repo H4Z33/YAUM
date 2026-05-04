@@ -60,12 +60,23 @@ def fisher_diagonal_sample(
     """
     E_leaf = E.detach().requires_grad_(True)
     embedded = F.embedding(context_indices, E_leaf)
-    hidden = model.init_hidden(context_indices.shape[0])
-    logits, _ = model(embedded, hidden)
-    loss = criterion(
-        logits.reshape(-1, model.vocab_size), target_indices.reshape(-1)
-    )
-    (grad,) = torch.autograd.grad(loss, E_leaf)
+    
+    # cuDNN RNN backward pass requires training mode on CUDA.
+    # We switch back to cuDNN for performance (5x speedup) now that VRAM is stable.
+    was_training = model.training
+    if not was_training:
+        model.train()
+    try:
+        hidden = model.init_hidden(context_indices.shape[0])
+        logits, _ = model(embedded, hidden)
+        loss = criterion(
+            logits.reshape(-1, model.vocab_size), target_indices.reshape(-1)
+        )
+        (grad,) = torch.autograd.grad(loss, E_leaf)
+    finally:
+        if not was_training:
+            model.eval()
+        
     return grad * grad
 
 

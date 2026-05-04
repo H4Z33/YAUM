@@ -53,8 +53,8 @@ def get_batch(data, context_window, batch_size, target_device):
             f"{context_window + 2} tokens, got {len(data)}."
         )
 
-    starts = torch.randint(0, max_start + 1, (batch_size,))
-    offsets = torch.arange(context_window)
+    starts = torch.randint(0, max_start + 1, (batch_size,), device=data.device)
+    offsets = torch.arange(context_window, device=data.device)
     idx = starts.unsqueeze(1) + offsets.unsqueeze(0)
     x = data[idx]
     y = data[idx + 1]
