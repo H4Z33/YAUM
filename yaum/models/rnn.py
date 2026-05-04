@@ -1,19 +1,4 @@
-import torch
 import torch.nn as nn
-
-# --- Define device within this module or import from utils ---
-try:
-    # Try importing from sibling module utils
-    from ..core.utils import device
-except ImportError:
-    # Fallback if run as script or import structure differs
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-         device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"(models/rnn.py) Using device: {device}")
 
 
 class RNNCharModel(nn.Module):
@@ -36,6 +21,6 @@ class RNNCharModel(nn.Module):
 
     def init_hidden(self, batch_size):
         weight = next(self.parameters()).data # Get device/dtype from existing params
-        h_0 = weight.new(self.n_layers, batch_size, self.hidden_dim).zero_().to(device)
-        c_0 = weight.new(self.n_layers, batch_size, self.hidden_dim).zero_().to(device)
+        h_0 = weight.new_zeros(self.n_layers, batch_size, self.hidden_dim)
+        c_0 = weight.new_zeros(self.n_layers, batch_size, self.hidden_dim)
         return (h_0, c_0)

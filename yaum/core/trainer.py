@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -31,6 +32,19 @@ from .integrators import make_integrator
 from .geometry import FisherMassConfig, FisherMassEstimator, fisher_diagonal_sample
 from .observables import ObservableWindow, snapshot
 from .utils import device, get_batch
+
+
+def _to_cpu_state(obj):
+    """Return a CPU-only copy of tensors inside checkpoint state."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, Mapping):
+        return {key: _to_cpu_state(value) for key, value in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_state(value) for value in obj)
+    if isinstance(obj, list):
+        return [_to_cpu_state(value) for value in obj]
+    return obj
 
 
 class Trainer:
@@ -89,6 +103,12 @@ class Trainer:
         os.makedirs(self.save_dir, exist_ok=True)
 
         self._stop_training_flag = False
+        self._step_delay = float(config.get("step_delay", 0.0))
+        self._safe_speed = config.get("safe_speed", True)  # Default on for stability
+        default_sync = 1 if self._safe_speed else 20
+        self._cuda_sync_interval = max(
+            1, int(config.get("cuda_sync_interval", default_sync))
+        )
 
     @staticmethod
     def _build_adaptive_controller(config) -> AdaptiveStepController | None:
@@ -116,12 +136,28 @@ class Trainer:
         mass_vector,
     ):
         print("Setting up trainer...")
-        self.train_data = train_data
-        self.test_data = test_data
+        # Keep corpus tensors on CPU. Large text files can consume enough VRAM
+        # to starve the model and trigger Windows TDR resets on display GPUs.
+        self.train_data = torch.as_tensor(train_data, dtype=torch.long).detach().cpu()
+        self.test_data = torch.as_tensor(test_data, dtype=torch.long).detach().cpu()
         self.char_to_idx = char_to_idx
         self.idx_to_char = idx_to_char
         self.vocab_size = vocab_size
         self.mass_vector = mass_vector.to(device)
+
+        # cuDNN benchmarking can launch long autotune kernels on first use. Keep
+        # it opt-in so the default path is safer on Windows display adapters.
+        if device.type == "cuda":
+            torch.backends.cudnn.enabled = not bool(
+                self.config.get("disable_cudnn", False)
+            )
+            torch.backends.cudnn.benchmark = bool(
+                self.config.get("cudnn_benchmark", False)
+                and torch.backends.cudnn.enabled
+            )
+            cudnn_mode = "enabled" if torch.backends.cudnn.enabled else "disabled"
+            mode = "enabled" if torch.backends.cudnn.benchmark else "disabled"
+            print(f"cuDNN {cudnn_mode}; benchmarking {mode}.")
 
         self.model = make_model(self.vocab_size, self.config).to(device)
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -176,9 +212,25 @@ class Trainer:
         self._current_dt = float(self.config["dt"])
         if self.adaptive is not None:
             self.adaptive.dt = self._current_dt
+        default_sync = 1 if self._safe_speed else 20
+        self._cuda_sync_interval = max(
+            1, int(self.config.get("cuda_sync_interval", default_sync))
+        )
         self._observables.clear()
         self._action.reset()
         print("Trainer setup complete.")
+
+    def _breathe(self, step: int) -> None:
+        if not self._safe_speed:
+            if self._step_delay > 0:
+                time.sleep(self._step_delay)
+            return
+        if device.type == "cuda" and step % self._cuda_sync_interval == 0:
+            torch.cuda.synchronize()
+        if self._step_delay > 0:
+            time.sleep(self._step_delay)
+        else:
+            time.sleep(0.001)
 
     def _refresh_fisher_mass(self) -> None:
         """Blend a fresh diagonal empirical Fisher into the mass estimator."""
@@ -187,7 +239,8 @@ class Trainer:
         cfg = self._fisher_cfg
         accum = torch.zeros_like(self.E)
         was_training = self.model.training
-        self.model.eval()
+        if was_training:
+            self.model.eval()
         try:
             for _ in range(cfg.batches_per_refresh):
                 try:
@@ -212,7 +265,8 @@ class Trainer:
     def _run_reversibility_probe(self, x_batch, y_batch) -> float:
         """Integrate forward/backward on the current batch and return residual."""
         was_training = self.model.training
-        self.model.eval()
+        if was_training:
+            self.model.eval()
         try:
             frozen_params = [p.requires_grad for p in self.model.parameters()]
             for p in self.model.parameters():
@@ -241,6 +295,7 @@ class Trainer:
     def _step_embeddings(self, x_batch, y_batch):
         """Run one integrator step and return (new_E, new_P, loss1, loss2)."""
         force_fn = make_rnn_force_fn(x_batch, y_batch, self.model, self.criterion)
+
         step = self.integrator.step(
             self.E,
             self.P,
@@ -272,13 +327,8 @@ class Trainer:
                 yield {"status": "stopped", "step": step}
                 break
 
-            if (
-                self._fisher is not None
-                and self._fisher_cfg is not None
-                and step > self.current_step
-                and (step - self.current_step) % self._fisher_cfg.refresh_every == 0
-            ):
-                self._refresh_fisher_mass()
+            # Fisher mass is now updated amortized inside _step_embeddings.
+            # We no longer need periodic lump refreshes.
 
             x_batch, y_batch = get_batch(
                 self.train_data,
@@ -288,7 +338,15 @@ class Trainer:
             )
 
             try:
+                P_prev = self.P
                 E_new, P_new, loss_l1, loss_l2 = self._step_embeddings(x_batch, y_batch)
+
+                # Update Fisher mass amortized once per step (fast, in-GPU EMA)
+                if self._fisher is not None:
+                    with torch.no_grad():
+                        force = (P_new - P_prev) / (-self._current_dt)
+                        self._fisher.update(force * force)
+                        self.mass_vector = self._fisher.current()
             except Exception as e:
                 print(f"ERROR during integrator step {step}: {e}")
                 yield {"status": "error", "message": f"Integrator step failed: {e}"}
@@ -299,16 +357,6 @@ class Trainer:
                 yield {"status": "error", "message": f"NaN loss at step {step}"}
                 break
 
-            with torch.no_grad():
-                dt = self._current_dt
-                force_eff_norm = (
-                    torch.linalg.norm((P_new - self.P) / dt).item() if dt else 0.0
-                )
-                p_norm = torch.linalg.norm(P_new).item()
-
-            self.E = E_new.requires_grad_(True)
-            self.P = P_new
-
             self.optimizer_W.zero_grad()
             try:
                 loss_l2.backward()
@@ -317,45 +365,47 @@ class Trainer:
                 yield {"status": "error", "message": f"W backward failed: {e}"}
                 break
 
-            with torch.no_grad():
-                total_norm_W_before = (
-                    sum(
-                        p.grad.data.norm(2).item() ** 2
-                        for p in self.model.parameters()
-                        if p.grad is not None
-                    )
-                    ** 0.5
-                )
-
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 max_norm=self.config["gradient_clip_norm_W"],
             )
             self.optimizer_W.step()
+            self.E = E_new.detach().requires_grad_(True)
+            self.P = P_new.detach()
             self.current_step = step + 1
+            self._breathe(step)
 
-            energy = total_hamiltonian(self.P, self.mass_vector, loss_l2)
-            if self._energy_reference is None:
-                self._energy_reference = energy
-            h_drift = energy.drift(self._energy_reference)
-
-            self._observables.push(snapshot(self.E, H=energy.total))
-            action_report = self._action.update(
-                kinetic=energy.kinetic,
-                potential=energy.potential,
-                dt=self._current_dt,
-            )
-
-            if self.adaptive is not None:
-                self._current_dt = self.adaptive.observe(h_drift)
-
+            # --- Telemetry & Evaluation (Only on eval steps) ---
             eval_every = self.config["eval_interval"]
             is_eval_step = (
-                self.current_step % eval_every == 0
-                or self.current_step == self.config["num_steps"]
+                (step + 1) % eval_every == 0
+                or (step + 1) == self.config["num_steps"]
             )
+
+
             if not is_eval_step:
                 continue
+
+            # Heavy telemetry and evaluation only on eval steps
+            with torch.no_grad():
+                dt = self._current_dt
+                force_eff_norm = (torch.linalg.norm((P_new - P_prev) / dt).item() if dt else 0.0)
+                p_norm = torch.linalg.norm(self.P).item()
+                total_norm_W_before = (
+                    sum(p.grad.data.norm(2).item() ** 2
+                        for p in self.model.parameters() if p.grad is not None) ** 0.5
+                )
+                energy = total_hamiltonian(self.P, self.mass_vector, loss_l2)
+                if self._energy_reference is None:
+                    self._energy_reference = energy
+                h_drift = energy.drift(self._energy_reference)
+
+                self._observables.push(snapshot(self.E, H=energy.total))
+                action_report = self._action.update(
+                    kinetic=energy.kinetic, potential=energy.potential, dt=self._current_dt
+                )
+                if self.adaptive is not None:
+                    self._current_dt = self.adaptive.observe(h_drift)
 
             eval_results = self.evaluate()
             test_loss = eval_results["test_loss"]
@@ -369,10 +419,7 @@ class Trainer:
 
             obs_report = self._observables.report()
             if obs_report is not None:
-                c_v = obs_report.specific_heat
-                chi = obs_report.susceptibility
-                tau = obs_report.corr_time
-                s_rate = obs_report.entropy_rate
+                c_v, chi, tau, s_rate = obs_report.specific_heat, obs_report.susceptibility, obs_report.corr_time, obs_report.entropy_rate
             else:
                 c_v = chi = tau = s_rate = float("nan")
 
@@ -396,8 +443,8 @@ class Trainer:
             log_message = (
                 f"Step {self.current_step}/{self.config['num_steps']} | T: {elapsed:.1f}s "
                 f"| L1: {loss_l1.item():.4f} | L2->W: {loss_l2.item():.4f} | Test L: {test_loss:.4f} "
-                f"| ||∇W||: {total_norm_W_before:.3f} | ||F_E||: {force_eff_norm:.3f} "
-                f"| ||P||: {p_norm:.3f} | ΔH/H: {h_drift:.3e} | dt: {self._current_dt:.3e}"
+                f"| ||âˆ‡W||: {total_norm_W_before:.3f} | ||F_E||: {force_eff_norm:.3f} "
+                f"| ||P||: {p_norm:.3f} | Î”H/H: {h_drift:.3e} | dt: {self._current_dt:.3e}"
             )
             print(log_message)
 
@@ -418,6 +465,7 @@ class Trainer:
             }
             self.save_checkpoint()
 
+
         if not self._stop_training_flag:
             print("\nTraining finished.")
             yield {
@@ -425,6 +473,12 @@ class Trainer:
                 "step": self.current_step,
                 "history": self.get_history(),
             }
+
+        # Final cleanup
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def evaluate(self):
         if self.model is None or self.test_data is None or len(self.test_data) == 0:
@@ -452,8 +506,12 @@ class Trainer:
                     print(f"Evaluation cannot sample a batch: {e}")
                     break
 
+                # Tiny breath for the GPU/OS every 25 eval batches
+                if k % 25 == 0:
+                    time.sleep(0.001)
+
                 # Each batch is sampled from random positions, so the hidden
-                # state must be reset per batch — persisting it across
+                # state must be reset per batch â€” persisting it across
                 # unrelated windows was silently corrupting the eval signal.
                 hidden = self.model.init_hidden(eval_batch_size)
 
@@ -500,12 +558,14 @@ class Trainer:
             "step": self.current_step,
             "config": self.config,
             "vocab_size": self.vocab_size,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": _to_cpu_state(self.model.state_dict()),
             "E": E_cpu,
             "P": P_cpu,
             "mass_vector": mass_cpu,
             "integrity": integrity.to_dict(),
-            "optimizer_W_state_dict": self.optimizer_W.state_dict(),
+            "optimizer_W_state_dict": _to_cpu_state(
+                self.optimizer_W.state_dict()
+            ),
             "train_losses_l1": self.train_losses_l1,
             "train_losses_l2": self.train_losses_l2,
             "test_losses": self.test_losses,
@@ -522,7 +582,9 @@ class Trainer:
 
     def load_checkpoint(self, filepath):
         try:
-            checkpoint = torch.load(filepath, map_location=device)
+            checkpoint = torch.load(
+                filepath, map_location="cpu", weights_only=False
+            )
             print(f"Loading checkpoint from {filepath}...")
 
             saved_fp = checkpoint.get("integrity")

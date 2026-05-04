@@ -22,9 +22,26 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     }
 }
 
-Write-Host "[yaum] uv $(uv --version) - resolving environment..."
-uv run `
-    --python ">=3.10" `
-    --with-requirements requirements.txt `
-    python -m yaum.ui.app @args
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    Write-Host "[yaum] NVIDIA GPU detected. Using CUDA-enabled PyTorch from requirements.txt."
+} else {
+    Write-Host "[yaum] No NVIDIA GPU detected. Warning: CUDA build will be used on CPU."
+}
+
+# Ensure .venv exists
+if (-not (Test-Path ".venv\Scripts\python.exe")) {
+    Write-Host "[yaum] Creating .venv with Python 3.12..."
+    uv venv --python 3.12 .venv
+}
+
+# Always sync dependencies
+Write-Host "[yaum] Syncing dependencies..."
+uv pip install -r requirements.txt --index-strategy unsafe-best-match
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "[yaum] Dependency sync failed."
+    exit $LASTEXITCODE
+}
+
+Write-Host "[yaum] Launching..."
+& .venv\Scripts\python.exe -m yaum.ui.app @args
 exit $LASTEXITCODE

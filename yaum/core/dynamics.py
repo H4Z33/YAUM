@@ -46,13 +46,18 @@ def calculate_loss_and_grads_rnn(
     is ``None`` only if autograd raises — the caller decides how to handle it.
     """
     batch_size, _ = context_indices.shape
-    hidden = model.init_hidden(batch_size)
-
-    batch_embeddings = F.embedding(context_indices, E_matrix)
-    logits, _ = model(batch_embeddings, hidden)
-    loss = criterion(logits.view(-1, model.vocab_size), target_indices.view(-1))
-
+    
+    # cuDNN RNN backward pass requires training mode on CUDA
+    was_training = model.training
+    if not was_training:
+        model.train()
+    
     try:
+        hidden = model.init_hidden(batch_size)
+        batch_embeddings = F.embedding(context_indices, E_matrix)
+        logits, _ = model(batch_embeddings, hidden)
+        loss = criterion(logits.view(-1, model.vocab_size), target_indices.view(-1))
+
         (embedding_grads,) = torch.autograd.grad(
             outputs=loss,
             inputs=batch_embeddings,
@@ -62,6 +67,9 @@ def calculate_loss_and_grads_rnn(
     except RuntimeError as err:
         print(f"autograd.grad failed: {err}")
         return loss, None, batch_embeddings
+    finally:
+        if not was_training:
+            model.eval()
 
     return loss, embedding_grads, batch_embeddings
 
