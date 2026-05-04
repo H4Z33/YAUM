@@ -33,6 +33,7 @@ APP_STATE = {
     "log_history": ["Welcome! Configure settings and prepare data."],  # Add this line to store log history
     "latest_history": None, # Store history fetched by generator
     "thread_active": False,  # Flag to track if thread is active
+    "prepared_config": None,
 }
 
 # --- Default Configuration ---
@@ -66,6 +67,10 @@ DEFAULT_CONFIG = {
     'disable_cudnn': False,
 }
 APP_STATE["config"] = DEFAULT_CONFIG.copy() # Initialize state with defaults
+
+CONFIG_KEYS_REQUIRING_PREPARE = tuple(
+    key for key in DEFAULT_CONFIG if key != "checkpoint_to_load"
+)
 
 def append_to_log(message):
     """Adds a message to the log history and updates the latest log."""
@@ -137,6 +142,28 @@ def update_config_value(key, value):
 def get_config_values(*keys):
      """Gets multiple config values for updating UI components."""
      return [APP_STATE["config"].get(k, DEFAULT_CONFIG.get(k)) for k in keys]
+
+
+def _config_mismatches(prepared, current):
+    """Return config keys whose current UI values no longer match setup."""
+    if not prepared:
+        return ["<not prepared>"]
+
+    mismatches = []
+    for key in CONFIG_KEYS_REQUIRING_PREPARE:
+        if prepared.get(key, DEFAULT_CONFIG.get(key)) != current.get(
+            key, DEFAULT_CONFIG.get(key)
+        ):
+            mismatches.append(key)
+    return mismatches
+
+
+def _append_effective_config_to_log(trainer):
+    if trainer is None:
+        return
+    for line in trainer.effective_config_lines():
+        append_to_log(line)
+
 
 def update_status(text):
     """Updates the global status message and log history."""
@@ -459,11 +486,14 @@ def prepare_data_and_model(config_dict_state):
 
         APP_STATE["data_loaded"] = True
         APP_STATE["model_ready"] = True
+        APP_STATE["prepared_config"] = config.copy()
+        _append_effective_config_to_log(APP_STATE["trainer"])
         return update_status(f"Data loaded & Trainer ready. Vocab size: {vocab_size}. Device: {device}.")
 
     except Exception as e:
         APP_STATE["data_loaded"] = False
         APP_STATE["model_ready"] = False
+        APP_STATE["prepared_config"] = None
         print(f"Error during data/model preparation: {e}")
         import traceback
         traceback.print_exc() # Print detailed error
@@ -522,11 +552,17 @@ def start_training_ui():
     if APP_STATE.get("thread_active"):
         return update_status("Training is already running.")
 
-    # Ensure config in trainer is up-to-date with UI potentially? Or assume prepare was clicked?
-    # For safety, let's update trainer's config if it exists
-    if APP_STATE.get("trainer"):
-         APP_STATE["trainer"].config = APP_STATE["config"].copy()
-         print("Updated trainer config before starting.")
+    mismatches = _config_mismatches(
+        APP_STATE.get("prepared_config"), APP_STATE["config"]
+    )
+    if mismatches:
+        shown = ", ".join(mismatches[:8])
+        if len(mismatches) > 8:
+            shown += f", ... ({len(mismatches)} total)"
+        return update_status(
+            "Config changed since Prepare. Click 'Prepare Data & Model / "
+            f"Apply Config' before starting. Changed: {shown}"
+        )
 
     status_msg = "Starting training..."
     print(status_msg)
@@ -720,6 +756,8 @@ def load_checkpoint_ui(filepath):
                     append_to_log(f"Warning: Could not load data file {data_path}: {de}")
 
             APP_STATE["model_ready"] = True
+            APP_STATE["prepared_config"] = APP_STATE["trainer"].config.copy()
+            _append_effective_config_to_log(APP_STATE["trainer"])
 
             status_msg = f"Checkpoint loaded successfully. Model ready at step: {APP_STATE['trainer'].current_step}"
             append_to_log(status_msg)
@@ -734,6 +772,7 @@ def load_checkpoint_ui(filepath):
         else:
             # Keep model marked as not ready
             APP_STATE["model_ready"] = False
+            APP_STATE["prepared_config"] = None
             status_msg = f"Failed to load checkpoint: {filepath}"
             append_to_log(status_msg)
             config_vals = get_config_values(*output_component_keys)
@@ -744,6 +783,7 @@ def load_checkpoint_ui(filepath):
         import traceback
         traceback.print_exc()
         APP_STATE["model_ready"] = False
+        APP_STATE["prepared_config"] = None
         status_msg = f"Error loading checkpoint: {e}"
         append_to_log(status_msg)
         config_vals = get_config_values(*output_component_keys)

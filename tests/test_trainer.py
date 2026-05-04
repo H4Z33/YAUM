@@ -61,6 +61,34 @@ def test_trainer_keeps_corpus_tensors_on_cpu(tmp_path):
     assert trainer.test_data.device.type == "cpu"
 
 
+def test_effective_config_summary_includes_runtime_tuning_keys(tmp_path):
+    config = _tiny_config(tmp_path)
+    config.update(
+        adaptive_dt=True,
+        dt_min=0.004,
+        dt_max=0.01,
+        drift_high=0.2,
+        drift_low=0.03,
+        safe_speed=True,
+        step_delay=0.001,
+        cuda_sync_interval=1,
+    )
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+
+    summary = "\n".join(trainer.effective_config_lines())
+
+    assert "train_tokens=200" in summary
+    assert "test_tokens=120" in summary
+    assert "context_window=6" in summary
+    assert "batch_size=4" in summary
+    assert "learning_rate_W=0.001" in summary
+    assert "adaptive_dt=True" in summary
+    assert "dt_min=0.004" in summary
+    assert "drift_low=0.03" in summary
+    assert "safe_speed=True" in summary
+
+
 def test_train_loop_commits_phase_state_on_non_eval_steps(tmp_path):
     config = _tiny_config(tmp_path, num_steps=3)
     config["eval_interval"] = 3

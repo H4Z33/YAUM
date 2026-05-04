@@ -47,6 +47,12 @@ def _to_cpu_state(obj):
     return obj
 
 
+def _fmt_config_value(value):
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
 class Trainer:
     def __init__(self, config):
         self.config = config
@@ -125,6 +131,86 @@ class Trainer:
             grow=float(config.get("dt_grow", 1.2)),
             grow_after=int(config.get("dt_grow_after", 10)),
         )
+
+    def effective_config_lines(self) -> list[str]:
+        """Return the runtime settings that materially affect a train run."""
+        lines = ["Effective trainer config:"]
+
+        data_bits = [f"device={device}", f"vocab_size={self.vocab_size}"]
+        if self.train_data is not None:
+            data_bits.append(f"train_tokens={len(self.train_data)}")
+        if self.test_data is not None:
+            data_bits.append(f"test_tokens={len(self.test_data)}")
+        data_file = self.config.get("data_file")
+        if data_file:
+            data_bits.append(f"data_file={data_file}")
+        lines.append("  data: " + ", ".join(data_bits))
+
+        groups = (
+            ("model", ("model_type", "embedding_dim", "hidden_dim", "n_layers")),
+            (
+                "training",
+                (
+                    "context_window",
+                    "batch_size",
+                    "num_steps",
+                    "eval_interval",
+                    "eval_iters",
+                    "eval_batch_size",
+                    "learning_rate_W",
+                    "gradient_clip_norm_W",
+                ),
+            ),
+            (
+                "dynamics",
+                (
+                    "integrator",
+                    "mass_type",
+                    "mass_mode",
+                    "dt",
+                    "adaptive_dt",
+                    "dt_min",
+                    "dt_max",
+                    "drift_high",
+                    "drift_low",
+                ),
+            ),
+            (
+                "safety",
+                (
+                    "safe_speed",
+                    "step_delay",
+                    "cuda_sync_interval",
+                    "cudnn_benchmark",
+                    "disable_cudnn",
+                ),
+            ),
+        )
+        for label, keys in groups:
+            parts = [
+                f"{key}={_fmt_config_value(self.config[key])}"
+                for key in keys
+                if key in self.config
+            ]
+            if parts:
+                lines.append(f"  {label}: " + ", ".join(parts))
+
+        if self.E is not None and self.P is not None:
+            lines.append(f"  state: E={tuple(self.E.shape)}, P={tuple(self.P.shape)}")
+        if self.mass_vector is not None:
+            mass = self.mass_vector.detach()
+            lines.append(
+                "  mass: "
+                f"shape={tuple(mass.shape)}, "
+                f"min={mass.min().item():.6g}, "
+                f"max={mass.max().item():.6g}, "
+                f"mean={mass.mean().item():.6g}"
+            )
+        return lines
+
+    def print_effective_config(self) -> None:
+        for line in self.effective_config_lines():
+            print(line)
 
     def setup(
         self,
@@ -218,6 +304,7 @@ class Trainer:
         )
         self._observables.clear()
         self._action.reset()
+        self.print_effective_config()
         print("Trainer setup complete.")
 
     def _breathe(self, step: int) -> None:
@@ -320,6 +407,7 @@ class Trainer:
             self._refresh_fisher_mass()
 
         print(f"Starting training from step {self.current_step}...")
+        self.print_effective_config()
 
         for step in range(self.current_step, self.config["num_steps"]):
             if self._stop_training_flag:
@@ -443,8 +531,8 @@ class Trainer:
             log_message = (
                 f"Step {self.current_step}/{self.config['num_steps']} | T: {elapsed:.1f}s "
                 f"| L1: {loss_l1.item():.4f} | L2->W: {loss_l2.item():.4f} | Test L: {test_loss:.4f} "
-                f"| ||âˆ‡W||: {total_norm_W_before:.3f} | ||F_E||: {force_eff_norm:.3f} "
-                f"| ||P||: {p_norm:.3f} | Î”H/H: {h_drift:.3e} | dt: {self._current_dt:.3e}"
+                f"| grad_W: {total_norm_W_before:.3f} | F_E: {force_eff_norm:.3f} "
+                f"| P_norm: {p_norm:.3f} | dH/H: {h_drift:.3e} | dt: {self._current_dt:.3e}"
             )
             print(log_message)
 
