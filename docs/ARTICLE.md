@@ -78,7 +78,7 @@ That gives you things a plain optimiser cannot:
                                 │
            ┌────────────────────┼────────────────────┐
            ▼                    ▼                    ▼
-    make_integrator()     make_model()         make_rnn_force_fn()
+    make_integrator()     make_model()         make_force_fn()
   leapfrog / yoshida4    rnn / transformer       loss → gradient
   langevin / multiscale                          → force tensor
            │                    │                    │
@@ -103,10 +103,16 @@ Files worth opening, in reading order:
 | path | what lives there |
 |---|---|
 | `yaum/core/integrators.py` | `SymplecticIntegrator`, leapfrog, yoshida4, langevin, multiscale |
-| `yaum/core/dynamics.py`    | `make_rnn_force_fn`, `total_hamiltonian`, `EnergyReport` |
+| `yaum/core/dynamics.py`    | `make_force_fn`, `total_hamiltonian`, `EnergyReport` |
+| `yaum/core/substrate.py`   | `HamiltonianSubstrate` explicit `(E, P, m, dt)` phase-state wrapper |
 | `yaum/core/adaptive.py`    | `AdaptiveStepController` — H-drift → dt feedback |
 | `yaum/core/diagnostics.py` | `measure_reversibility` — forward/backward probe |
 | `yaum/core/integrity.py`   | `CheckpointIntegrity` — physical fingerprint |
+
+New trainer runs default to the information-geometric branch: Fisher mass,
+adaptive `dt`, periodic snapshots, and phase-shift snapshots. Older checkpoints
+with scalar mass are loaded conservatively so their original phase geometry is
+not silently rewritten.
 | `yaum/core/trainer.py`     | the glue |
 | `yaum/models/*`            | RNN and Transformer, both behind the same interface |
 | `yaum/ui/app.py`           | Gradio dashboard with a 3×3 live metric grid |

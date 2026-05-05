@@ -40,21 +40,35 @@ APP_STATE = {
 DEFAULT_CONFIG = {
     'data_file': '',
     'test_split_ratio': 0.1,
+    'model_type': 'rnn',
     'embedding_dim': 64,
     'context_window': 128,
     'hidden_dim': 256,
     'n_layers': 2,
     'dt': 0.01,
     'mass_type': 'frequency',
+    'mass_mode': 'fisher',
     'num_steps': 15000,
     'batch_size': 32,
     'learning_rate_W': 0.001,
     'eval_interval': 1000,
     'eval_iters': 20,
     'eval_batch_size': 16,
+    'snapshot_interval': 5000,
+    'snapshot_keep_last': 100,
+    'snapshot_on_shift': True,
+    'snapshot_shift_cooldown': 5000,
+    'snapshot_shift_force_min': 5.0,
+    'snapshot_shift_force_ratio': 2.0,
+    'snapshot_shift_momentum_delta': 0.5,
+    'snapshot_shift_drift_delta': 0.25,
+    'snapshot_shift_susceptibility_min': 0.25,
+    'snapshot_shift_susceptibility_ratio': 2.0,
+    'reversibility_check_interval': 10,
+    'reversibility_check_steps': 5,
     'gradient_clip_norm_W': 1.0,
-    'adaptive_dt': False,
-    'dt_min': 0.001,
+    'adaptive_dt': True,
+    'dt_min': 0.00001,
     'dt_max': 0.01,
     'drift_high': 0.05,
     'drift_low': 0.001,
@@ -119,11 +133,15 @@ def update_config_value(key, value):
     """Updates a single value in the global config state."""
     if value is not None:
          # Basic type casting for numerical inputs from Gradio
-         if key in ['embedding_dim', 'context_window', 'hidden_dim', 'n_layers', 'num_steps', 'batch_size', 'eval_interval', 'eval_iters', 'eval_batch_size', 'cuda_sync_interval']:
+         if key in ['embedding_dim', 'context_window', 'hidden_dim', 'n_layers', 'num_steps', 'batch_size', 'eval_interval', 'eval_iters', 'eval_batch_size', 'snapshot_interval', 'snapshot_keep_last', 'reversibility_check_interval', 'reversibility_check_steps', 'cuda_sync_interval']:
              try:
                  value = int(value)
              except (ValueError, TypeError):
                  value = DEFAULT_CONFIG.get(key) # Reset on error
+             if key in {'snapshot_interval', 'snapshot_keep_last', 'reversibility_check_interval'} and value < 0:
+                 value = DEFAULT_CONFIG.get(key)
+             elif key == 'reversibility_check_steps' and value < 1:
+                 value = DEFAULT_CONFIG.get(key)
          elif key in ['test_split_ratio', 'dt', 'learning_rate_W', 'gradient_clip_norm_W', 'step_delay', 'dt_min', 'dt_max', 'drift_high', 'drift_low']:
              try:
                  value = float(value)
@@ -133,8 +151,12 @@ def update_config_value(key, value):
                  value = DEFAULT_CONFIG.get(key)
              elif key == 'drift_low' and value < 0:
                  value = DEFAULT_CONFIG.get(key)
-         elif key in ['safe_speed', 'adaptive_dt', 'cudnn_benchmark', 'disable_cudnn']:
+         elif key in ['safe_speed', 'adaptive_dt', 'snapshot_on_shift', 'cudnn_benchmark', 'disable_cudnn']:
              value = bool(value)
+         elif key == 'model_type':
+             value = value if value in {'rnn', 'transformer'} else DEFAULT_CONFIG[key]
+         elif key == 'mass_mode':
+             value = value if value in {'static', 'fisher'} else DEFAULT_CONFIG[key]
          APP_STATE["config"][key] = value
     # Return the possibly updated value to the UI component
     return APP_STATE["config"].get(key, DEFAULT_CONFIG.get(key))
@@ -647,9 +669,11 @@ def restore_default_config():
 
     # Get all the default values to update UI
     output_component_keys = [
-        'data_file', 'test_split_ratio', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
-        'dt', 'mass_type', 'num_steps', 'batch_size', 'learning_rate_W',
-        'eval_interval', 'eval_iters', 'eval_batch_size', 'gradient_clip_norm_W',
+        'data_file', 'test_split_ratio', 'model_type', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
+        'dt', 'mass_type', 'mass_mode', 'num_steps', 'batch_size', 'learning_rate_W',
+        'eval_interval', 'eval_iters', 'eval_batch_size', 'snapshot_interval',
+        'snapshot_keep_last', 'reversibility_check_interval',
+        'reversibility_check_steps', 'gradient_clip_norm_W',
         'adaptive_dt', 'dt_min', 'dt_max', 'drift_high', 'drift_low',
         'step_delay', 'safe_speed', 'cudnn_benchmark', 'disable_cudnn'
     ]
@@ -667,9 +691,11 @@ def load_checkpoint_ui(filepath):
     """Loads a checkpoint and sets up the trainer."""
     # Define the expected output components structure
     output_component_keys = [
-        'data_file', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
-        'dt', 'mass_type', 'num_steps', 'batch_size', 'learning_rate_W',
-        'eval_interval', 'eval_iters', 'eval_batch_size', 'gradient_clip_norm_W',
+        'data_file', 'model_type', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
+        'dt', 'mass_type', 'mass_mode', 'num_steps', 'batch_size', 'learning_rate_W',
+        'eval_interval', 'eval_iters', 'eval_batch_size', 'snapshot_interval',
+        'snapshot_keep_last', 'reversibility_check_interval',
+        'reversibility_check_steps', 'gradient_clip_norm_W',
         'adaptive_dt', 'dt_min', 'dt_max', 'drift_high', 'drift_low',
         'step_delay', 'safe_speed', 'cudnn_benchmark', 'disable_cudnn'
     ]
@@ -841,19 +867,21 @@ def create_ui():
                         test_split_ratio_input = gr.Slider(label="Test Split Ratio", minimum=0.01, maximum=0.5, step=0.01, value=DEFAULT_CONFIG['test_split_ratio'])
 
                         gr.Markdown("### Model Architecture")
+                        model_type_input = gr.Dropdown(label="Model Family", choices=["rnn", "transformer"], value=DEFAULT_CONFIG['model_type'], elem_classes="gr-input")
                         embedding_dim_input = gr.Number(label="Embedding Dim", value=DEFAULT_CONFIG['embedding_dim'], precision=0, elem_classes="gr-input")
                         context_window_input = gr.Number(label="Context Window", value=DEFAULT_CONFIG['context_window'], precision=0, elem_classes="gr-input")
-                        hidden_dim_input = gr.Number(label="RNN Hidden Dim", value=DEFAULT_CONFIG['hidden_dim'], precision=0, elem_classes="gr-input")
-                        n_layers_input = gr.Number(label="RNN Layers", value=DEFAULT_CONFIG['n_layers'], precision=0, elem_classes="gr-input")
+                        hidden_dim_input = gr.Number(label="Hidden Dim", value=DEFAULT_CONFIG['hidden_dim'], precision=0, elem_classes="gr-input")
+                        n_layers_input = gr.Number(label="Layers", value=DEFAULT_CONFIG['n_layers'], precision=0, elem_classes="gr-input")
 
                     # Right Column - Dynamics & Training
                     with gr.Column(scale=1):
                         gr.Markdown("### Hamiltonian Dynamics")
                         dt_input = gr.Number(label="dt (Time Step)", value=DEFAULT_CONFIG['dt'], minimum=0.0001, step=0.001, elem_classes="gr-input")
                         mass_type_input = gr.Dropdown(label="Mass Type", choices=["uniform", "frequency", "inverse_frequency"], value=DEFAULT_CONFIG['mass_type'], elem_classes="gr-input")
+                        mass_mode_input = gr.Dropdown(label="Mass Mode", choices=["static", "fisher"], value=DEFAULT_CONFIG['mass_mode'], elem_classes="gr-input")
                         adaptive_dt_input = gr.Checkbox(label="Adaptive dt", value=DEFAULT_CONFIG['adaptive_dt'], info="Shrink dt when Hamiltonian drift rises.")
                         with gr.Row():
-                            dt_min_input = gr.Number(label="dt Min", value=DEFAULT_CONFIG['dt_min'], minimum=0.0, step=0.0005, elem_classes="gr-input")
+                            dt_min_input = gr.Number(label="dt Min", value=DEFAULT_CONFIG['dt_min'], minimum=0.000001, step=0.00001, elem_classes="gr-input")
                             dt_max_input = gr.Number(label="dt Max", value=DEFAULT_CONFIG['dt_max'], minimum=0.0, step=0.001, elem_classes="gr-input")
                         with gr.Row():
                             drift_high_input = gr.Number(label="Drift High", value=DEFAULT_CONFIG['drift_high'], minimum=0.0, step=0.005, elem_classes="gr-input")
@@ -866,6 +894,10 @@ def create_ui():
                         eval_interval_input = gr.Number(label="Eval Interval (steps)", value=DEFAULT_CONFIG['eval_interval'], precision=0, step=100, elem_classes="gr-input")
                         eval_iters_input = gr.Number(label="Eval Iters", value=DEFAULT_CONFIG['eval_iters'], precision=0, step=5, elem_classes="gr-input")
                         eval_batch_size_input = gr.Number(label="Eval Batch Size", value=DEFAULT_CONFIG['eval_batch_size'], precision=0, step=8, elem_classes="gr-input")
+                        snapshot_interval_input = gr.Number(label="Snapshot Interval (steps)", value=DEFAULT_CONFIG['snapshot_interval'], precision=0, step=1000, elem_classes="gr-input")
+                        snapshot_keep_last_input = gr.Number(label="Keep Snapshots", value=DEFAULT_CONFIG['snapshot_keep_last'], precision=0, step=10, elem_classes="gr-input")
+                        reversibility_interval_input = gr.Number(label="Reversibility Interval (evals)", value=DEFAULT_CONFIG['reversibility_check_interval'], precision=0, step=1, elem_classes="gr-input")
+                        reversibility_steps_input = gr.Number(label="Reversibility Steps", value=DEFAULT_CONFIG['reversibility_check_steps'], precision=0, step=1, elem_classes="gr-input")
                         gradient_clip_norm_W_input = gr.Number(label="Grad Clip Norm (W)", value=DEFAULT_CONFIG['gradient_clip_norm_W'], minimum=0.1, step=0.1, elem_classes="gr-input")
                         step_delay_input = gr.Slider(label="System Throttle (Step Delay)", minimum=0.0, maximum=0.1, step=0.001, value=DEFAULT_CONFIG['step_delay'], info="Tiny delay between steps to keep UI/OS responsive.")
                         safe_speed_input = gr.Checkbox(label="Safe-Speed Mode", value=DEFAULT_CONFIG['safe_speed'], info="Synchronize GPU periodically to prevent driver crashes (TDR).")
@@ -881,9 +913,12 @@ def create_ui():
                 # Must match the order returned by the function AND the variable names used above
                 config_output_components_for_load = [
                     status_textbox,
-                    data_file_input, embedding_dim_input, context_window_input, hidden_dim_input, n_layers_input,
-                    dt_input, mass_type_input, num_steps_input, batch_size_input, learning_rate_W_input,
-                    eval_interval_input, eval_iters_input, eval_batch_size_input, gradient_clip_norm_W_input,
+                    data_file_input, model_type_input, embedding_dim_input, context_window_input, hidden_dim_input, n_layers_input,
+                    dt_input, mass_type_input, mass_mode_input, num_steps_input, batch_size_input, learning_rate_W_input,
+                    eval_interval_input, eval_iters_input, eval_batch_size_input,
+                    snapshot_interval_input, snapshot_keep_last_input,
+                    reversibility_interval_input, reversibility_steps_input,
+                    gradient_clip_norm_W_input,
                     adaptive_dt_input, dt_min_input, dt_max_input, drift_high_input, drift_low_input,
                     step_delay_input, safe_speed_input, cudnn_benchmark_input, disable_cudnn_input
                 ]
@@ -913,10 +948,12 @@ def create_ui():
                 # Define all components that should be updated with defaults
                 restore_defaults_components = [
                     status_textbox,
-                    data_file_input, test_split_ratio_input, embedding_dim_input, context_window_input,
-                    hidden_dim_input, n_layers_input, dt_input, mass_type_input, num_steps_input,
-                    batch_size_input, learning_rate_W_input, eval_interval_input, eval_iters_input,
-                    eval_batch_size_input, gradient_clip_norm_W_input, adaptive_dt_input,
+                    data_file_input, test_split_ratio_input, model_type_input, embedding_dim_input, context_window_input,
+                    hidden_dim_input, n_layers_input, dt_input, mass_type_input, mass_mode_input, num_steps_input,
+                    batch_size_input, learning_rate_W_input, eval_interval_input,
+                    eval_iters_input, eval_batch_size_input, snapshot_interval_input,
+                    snapshot_keep_last_input, reversibility_interval_input,
+                    reversibility_steps_input, gradient_clip_norm_W_input, adaptive_dt_input,
                     dt_min_input, dt_max_input, drift_high_input, drift_low_input,
                     step_delay_input, safe_speed_input, cudnn_benchmark_input, disable_cudnn_input
                 ]
@@ -934,12 +971,14 @@ def create_ui():
                 # Attach .change listeners AFTER components are defined to update APP_STATE config
                 data_file_input.change(lambda x: update_config_value('data_file', x), inputs=data_file_input, outputs=data_file_input)
                 test_split_ratio_input.change(lambda x: update_config_value('test_split_ratio', x), inputs=test_split_ratio_input, outputs=test_split_ratio_input)
+                model_type_input.change(lambda x: update_config_value('model_type', x), inputs=model_type_input, outputs=model_type_input)
                 embedding_dim_input.change(lambda x: update_config_value('embedding_dim', x), inputs=embedding_dim_input, outputs=embedding_dim_input)
                 context_window_input.change(lambda x: update_config_value('context_window', x), inputs=context_window_input, outputs=context_window_input)
                 hidden_dim_input.change(lambda x: update_config_value('hidden_dim', x), inputs=hidden_dim_input, outputs=hidden_dim_input)
                 n_layers_input.change(lambda x: update_config_value('n_layers', x), inputs=n_layers_input, outputs=n_layers_input)
                 dt_input.change(lambda x: update_config_value('dt', x), inputs=dt_input, outputs=dt_input)
                 mass_type_input.change(lambda x: update_config_value('mass_type', x), inputs=mass_type_input, outputs=mass_type_input)
+                mass_mode_input.change(lambda x: update_config_value('mass_mode', x), inputs=mass_mode_input, outputs=mass_mode_input)
                 adaptive_dt_input.change(lambda x: update_config_value('adaptive_dt', x), inputs=adaptive_dt_input, outputs=adaptive_dt_input)
                 dt_min_input.change(lambda x: update_config_value('dt_min', x), inputs=dt_min_input, outputs=dt_min_input)
                 dt_max_input.change(lambda x: update_config_value('dt_max', x), inputs=dt_max_input, outputs=dt_max_input)
@@ -951,6 +990,10 @@ def create_ui():
                 eval_interval_input.change(lambda x: update_config_value('eval_interval', x), inputs=eval_interval_input, outputs=eval_interval_input)
                 eval_iters_input.change(lambda x: update_config_value('eval_iters', x), inputs=eval_iters_input, outputs=eval_iters_input)
                 eval_batch_size_input.change(lambda x: update_config_value('eval_batch_size', x), inputs=eval_batch_size_input, outputs=eval_batch_size_input)
+                snapshot_interval_input.change(lambda x: update_config_value('snapshot_interval', x), inputs=snapshot_interval_input, outputs=snapshot_interval_input)
+                snapshot_keep_last_input.change(lambda x: update_config_value('snapshot_keep_last', x), inputs=snapshot_keep_last_input, outputs=snapshot_keep_last_input)
+                reversibility_interval_input.change(lambda x: update_config_value('reversibility_check_interval', x), inputs=reversibility_interval_input, outputs=reversibility_interval_input)
+                reversibility_steps_input.change(lambda x: update_config_value('reversibility_check_steps', x), inputs=reversibility_steps_input, outputs=reversibility_steps_input)
                 gradient_clip_norm_W_input.change(lambda x: update_config_value('gradient_clip_norm_W', x), inputs=gradient_clip_norm_W_input, outputs=gradient_clip_norm_W_input)
                 step_delay_input.change(lambda x: update_config_value('step_delay', x), inputs=step_delay_input, outputs=step_delay_input)
                 safe_speed_input.change(lambda x: update_config_value('safe_speed', x), inputs=safe_speed_input, outputs=safe_speed_input)

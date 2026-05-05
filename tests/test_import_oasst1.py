@@ -97,3 +97,42 @@ def test_chat_compact_filter_rejects_code_and_ai_disclaimer(tmp_path):
     assert stats["transcripts"] == 0
     assert "```" in stats["rejected"]
     assert r"\bas an ai\b" in stats["rejected"]
+
+
+def test_chat_creative_profile_prefers_creative_or_supportive_prompts(tmp_path):
+    mod = _load_importer()
+    messages = {
+        "u1": _row("prompter", "Write me a short bedtime story about a moon rabbit."),
+        "a1": _row(
+            "assistant",
+            "Once there was a moon rabbit who stitched silver dreams into the night sky for sleepy children below.",
+            parent_id="u1",
+        ),
+        "u2": _row("prompter", "What GPU should I buy for Open Assistant?"),
+        "a2": _row(
+            "assistant",
+            "A midrange GPU with enough memory will usually be the practical starting point for local experimentation.",
+            parent_id="u2",
+        ),
+    }
+
+    stats = mod._build_chat_compact_corpus(
+        messages=messages,
+        output=tmp_path / "chat.txt",
+        window_messages=4,
+        min_user_chars=8,
+        max_user_chars=280,
+        min_assistant_chars=48,
+        max_assistant_chars=900,
+        min_user_quality=0.2,
+        min_assistant_quality=0.45,
+        max_toxicity=0.5,
+        include_patterns=mod.CHAT_CREATIVE_INCLUDE_PATTERNS,
+        exclude_patterns=mod.CHAT_CREATIVE_EXCLUDE_PATTERNS,
+    )
+
+    text = (tmp_path / "chat.txt").read_text(encoding="utf-8")
+    assert stats["transcripts"] == 1
+    assert "moon rabbit" in text
+    assert "Open Assistant" not in text
+    assert "profile_exclude" in stats["rejected"]

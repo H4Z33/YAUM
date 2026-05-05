@@ -51,6 +51,8 @@ def test_trainer_setup_instantiates_state(tmp_path):
     assert trainer.model is not None
     assert trainer.E.shape == (8, 4)
     assert trainer.P.shape == (8, 4)
+    assert trainer.substrate is not None
+    assert trainer.substrate.E is trainer.E
     assert trainer.integrator.name == "leapfrog"
 
 
@@ -149,6 +151,60 @@ def test_checkpoint_round_trip(tmp_path):
     assert torch.allclose(reloaded.P, trainer.P)
 
 
+def test_trainer_writes_periodic_snapshots(tmp_path):
+    torch.manual_seed(0)
+    config = _tiny_config(tmp_path, num_steps=3)
+    config["eval_interval"] = 1
+    config["snapshot_interval"] = 2
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    list(trainer.train())
+
+    names = sorted(
+        name
+        for name in os.listdir(trainer.save_dir)
+        if name.startswith("checkpoint_step_") and name.endswith(".pt")
+    )
+    assert names == ["checkpoint_step_00000002.pt", "checkpoint_step_00000003.pt"]
+    state = torch.load(
+        os.path.join(trainer.save_dir, names[0]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert state["checkpoint_kind"] == "snapshot"
+
+
+def test_trainer_writes_phase_shift_snapshot(tmp_path):
+    config = _tiny_config(tmp_path, num_steps=1)
+    config.update(
+        snapshot_on_shift=True,
+        snapshot_shift_cooldown=0,
+        snapshot_shift_force_min=5.0,
+        snapshot_shift_force_ratio=2.0,
+    )
+    trainer = Trainer(config)
+    _tiny_setup(trainer)
+    trainer.current_step = 1000
+    for key in trainer.debug_stats:
+        trainer.debug_stats[key] = [0.0, 0.0]
+    trainer.debug_stats["force_E"] = [2.0, 6.0]
+
+    trainer._maybe_save_shift_snapshot()
+
+    names = [
+        name
+        for name in os.listdir(trainer.save_dir)
+        if name.startswith("checkpoint_shift_") and name.endswith(".pt")
+    ]
+    assert len(names) == 1
+    state = torch.load(
+        os.path.join(trainer.save_dir, names[0]),
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert state["checkpoint_kind"] == "phase_shift"
+
+
 def test_generate_produces_requested_length(tmp_path):
     torch.manual_seed(0)
     trainer = Trainer(_tiny_config(tmp_path))
@@ -226,8 +282,21 @@ def test_trainer_runs_with_langevin_thermostat(tmp_path):
     assert trainer.integrator.name == "langevin"
 
 
-def test_adaptive_dt_off_by_default(tmp_path):
+def test_adaptive_dt_on_by_default(tmp_path):
     trainer = Trainer(_tiny_config(tmp_path))
+    assert trainer.adaptive is not None
+    assert trainer.config["mass_mode"] == "fisher"
+    assert trainer.config["dt_min"] == 0.00001
+    assert trainer.config["dt_max"] == 0.01
+    assert trainer.config["snapshot_on_shift"] is True
+    assert trainer.config["snapshot_interval"] > 0
+    assert trainer.config["reversibility_check_interval"] > 0
+
+
+def test_adaptive_dt_can_be_disabled(tmp_path):
+    config = _tiny_config(tmp_path)
+    config["adaptive_dt"] = False
+    trainer = Trainer(config)
     assert trainer.adaptive is None
 
 

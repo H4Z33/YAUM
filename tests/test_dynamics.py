@@ -4,15 +4,17 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from yaum.core.dynamics import (
     EnergyReport,
+    calculate_loss_and_embedding_grads,
     calculate_loss_and_grads_rnn,
     kinetic_energy,
+    make_force_fn,
     make_rnn_force_fn,
     total_hamiltonian,
 )
+from yaum.models.transformer import TransformerCharModel
 
 
 class TinyRNN(nn.Module):
@@ -53,6 +55,15 @@ def rnn_setup():
 
 def test_loss_and_grads_shape_matches_batch(rnn_setup):
     model, criterion, E, _, _, context, target = rnn_setup
+    loss, grads, embedded = calculate_loss_and_embedding_grads(
+        context, target, E, model, criterion
+    )
+    assert grads.shape == embedded.shape
+    assert torch.isfinite(loss)
+
+
+def test_rnn_gradient_alias_still_works(rnn_setup):
+    model, criterion, E, _, _, context, target = rnn_setup
     loss, grads, embedded = calculate_loss_and_grads_rnn(
         context, target, E, model, criterion
     )
@@ -62,7 +73,7 @@ def test_loss_and_grads_shape_matches_batch(rnn_setup):
 
 def test_force_fn_is_sparse_on_inactive_tokens(rnn_setup):
     model, criterion, E, _, _, context, target = rnn_setup
-    force_fn = make_rnn_force_fn(context, target, model, criterion)
+    force_fn = make_force_fn(context, target, model, criterion)
     _, force = force_fn(E, retain_graph=False)
 
     active = set(context.flatten().tolist())
@@ -81,6 +92,29 @@ def test_force_fn_accumulates_repeated_tokens(rnn_setup):
     _, force = force_fn(E, retain_graph=False)
     # The fact it does not error and produces a nonzero force on token 2 is the spec.
     assert force[2].abs().sum().item() > 0
+
+
+def test_force_fn_runs_with_transformer_model():
+    torch.manual_seed(0)
+    model = TransformerCharModel(
+        vocab_size=7,
+        embedding_dim=4,
+        hidden_dim=8,
+        n_layers=1,
+        n_heads=2,
+        max_context=4,
+    )
+    criterion = nn.CrossEntropyLoss()
+    E = torch.randn(model.vocab_size, model.embedding_dim, requires_grad=True)
+    context = torch.tensor([[0, 1, 2], [3, 4, 5]])
+    target = torch.tensor([[1, 2, 3], [4, 5, 6]])
+
+    force_fn = make_force_fn(context, target, model, criterion)
+    loss, force = force_fn(E, retain_graph=False)
+
+    assert torch.isfinite(loss)
+    assert force.shape == E.shape
+    assert force.abs().sum().item() > 0
 
 
 def test_kinetic_energy_is_nonnegative_and_scales_quadratically():

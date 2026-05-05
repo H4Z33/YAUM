@@ -1,22 +1,26 @@
 """Force fields and Hamiltonian observables for embedding dynamics.
 
-This module is the bridge between the neural network and the integrators in
+This module is the bridge between a sequence model and the integrators in
 ``yaum.core.integrators``. It exposes:
 
-* ``calculate_loss_and_grads_rnn`` — forward/backward through an RNN to
-  extract the gradient of the loss w.r.t. the input embedding tensor.
-* ``make_rnn_force_fn`` — turn that gradient into a closure usable by any
+* ``calculate_loss_and_embedding_grads`` -- forward/backward through a model
+  to extract the gradient of the loss w.r.t. the input embedding tensor.
+* ``make_force_fn`` -- turn that gradient into a closure usable by any
   symplectic integrator.
-* ``kinetic_energy`` / ``total_hamiltonian`` — observables that let the
+* ``kinetic_energy`` / ``total_hamiltonian`` -- observables that let the
   trainer monitor how well the integrator preserves the energy of the
   embedding system.
+
+The older ``*_rnn`` names remain as compatibility aliases. The force-field
+contract is model-agnostic: the model only needs ``vocab_size``,
+``init_hidden(batch_size)``, and ``forward(embedded, hidden)``.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .integrators import ForceField, LeapfrogIntegrator
@@ -32,7 +36,15 @@ except ImportError:  # pragma: no cover - device fallback
         device = torch.device("cpu")
 
 
-def calculate_loss_and_grads_rnn(
+def _needs_training_mode_for_backward(model, E_matrix: torch.Tensor) -> bool:
+    """Return true for cuDNN recurrent modules that reject eval-mode backward."""
+    if E_matrix.device.type != "cuda" or not torch.backends.cudnn.enabled:
+        return False
+    recurrent_types = (nn.RNN, nn.LSTM, nn.GRU)
+    return any(isinstance(module, recurrent_types) for module in model.modules())
+
+
+def calculate_loss_and_embedding_grads(
     context_indices: torch.Tensor,
     target_indices: torch.Tensor,
     E_matrix: torch.Tensor,
@@ -40,23 +52,28 @@ def calculate_loss_and_grads_rnn(
     criterion,
     retain_graph: bool = False,
 ):
-    """Forward the RNN on embedded context and grab d(loss)/d(batch_embeddings).
+    """Forward a model on embedded context and grab d(loss)/d(batch_embeddings).
 
     Returns ``(loss, embedding_grads, batch_embeddings)``. ``embedding_grads``
-    is ``None`` only if autograd raises — the caller decides how to handle it.
+    is ``None`` only if autograd raises after the forward pass; the caller
+    decides how to handle it.
     """
     batch_size, _ = context_indices.shape
-    
-    # cuDNN RNN backward pass requires training mode on CUDA
+    loss = None
+    batch_embeddings = None
+
     was_training = model.training
-    if not was_training:
+    force_training_mode = (
+        not was_training and _needs_training_mode_for_backward(model, E_matrix)
+    )
+    if force_training_mode:
         model.train()
-    
+
     try:
         hidden = model.init_hidden(batch_size)
         batch_embeddings = F.embedding(context_indices, E_matrix)
         logits, _ = model(batch_embeddings, hidden)
-        loss = criterion(logits.view(-1, model.vocab_size), target_indices.view(-1))
+        loss = criterion(logits.reshape(-1, model.vocab_size), target_indices.reshape(-1))
 
         (embedding_grads,) = torch.autograd.grad(
             outputs=loss,
@@ -66,15 +83,17 @@ def calculate_loss_and_grads_rnn(
         )
     except RuntimeError as err:
         print(f"autograd.grad failed: {err}")
+        if loss is None or batch_embeddings is None:
+            raise
         return loss, None, batch_embeddings
     finally:
-        if not was_training:
+        if force_training_mode:
             model.eval()
 
     return loss, embedding_grads, batch_embeddings
 
 
-def make_rnn_force_fn(
+def make_force_fn(
     context_indices: torch.Tensor,
     target_indices: torch.Tensor,
     model,
@@ -84,14 +103,14 @@ def make_rnn_force_fn(
 
     The returned closure scatters the per-token-position gradient back into
     a full ``(vocab_size, embedding_dim)`` force tensor. Token positions not
-    seen in this batch feel zero force, which is exactly what we want: they
-    stay on whatever trajectory they were on.
+    seen in this batch feel zero force, so they stay on their current
+    trajectory.
     """
     indices_flat = context_indices.reshape(-1)
 
     def force_fn(E: torch.Tensor, *, retain_graph: bool):
         E_in = E if E.requires_grad else E.detach().requires_grad_(True)
-        loss, grad_batch, _ = calculate_loss_and_grads_rnn(
+        loss, grad_batch, _ = calculate_loss_and_embedding_grads(
             context_indices,
             target_indices,
             E_in,
@@ -106,6 +125,16 @@ def make_rnn_force_fn(
         return loss, force
 
     return force_fn
+
+
+def calculate_loss_and_grads_rnn(*args, **kwargs):
+    """Compatibility alias for :func:`calculate_loss_and_embedding_grads`."""
+    return calculate_loss_and_embedding_grads(*args, **kwargs)
+
+
+def make_rnn_force_fn(*args, **kwargs) -> ForceField:
+    """Compatibility alias for :func:`make_force_fn`."""
+    return make_force_fn(*args, **kwargs)
 
 
 @dataclass
@@ -132,15 +161,15 @@ def total_hamiltonian(
     """Assemble (T, V, H) with V taken from the current loss value.
 
     Treating the loss as potential energy is the defining move of this
-    project: the model's error field *is* the landscape the embeddings
-    roll through.
+    project: the model's error field is the landscape the embeddings roll
+    through.
     """
     T = float(kinetic_energy(P, mass).detach())
     V = float(potential.detach()) if torch.is_tensor(potential) else float(potential)
     return EnergyReport(kinetic=T, potential=V, total=T + V)
 
 
-def hamiltonian_step_rnn(
+def hamiltonian_step(
     context_indices,
     target_indices,
     E,
@@ -151,9 +180,14 @@ def hamiltonian_step_rnn(
     dt,
 ):
     """Backward-compatible leapfrog step. New code should use integrators directly."""
-    force_fn = make_rnn_force_fn(context_indices, target_indices, model, criterion)
+    force_fn = make_force_fn(context_indices, target_indices, model, criterion)
     E_leaf = E if E.requires_grad else E.detach().requires_grad_(True)
     step = LeapfrogIntegrator().step(
         E_leaf, P, dt, force_fn, mass_vector, retain_final=True
     )
     return step.E, step.P, step.loss_initial, step.loss_final
+
+
+def hamiltonian_step_rnn(*args, **kwargs):
+    """Compatibility alias for :func:`hamiltonian_step`."""
+    return hamiltonian_step(*args, **kwargs)

@@ -36,7 +36,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from yaum.core.dynamics import make_rnn_force_fn, total_hamiltonian
+from yaum.core.dynamics import make_force_fn, total_hamiltonian
 from yaum.core.integrators import make_integrator
 from yaum.core.utils import get_batch
 from yaum.models.rnn import RNNCharModel
@@ -194,7 +194,7 @@ def run_yaum(train_data, test_data, vocab_size, cfg, seed, integrator_name) -> R
     t0 = time.perf_counter()
     for _ in range(cfg["num_steps"]):
         x, y = get_batch(train_data, cfg["context_window"], cfg["batch_size"], "cpu")
-        force_fn = make_rnn_force_fn(x, y, model, criterion)
+        force_fn = make_force_fn(x, y, model, criterion)
         step = integrator.step(
             E, P, cfg["dt"], force_fn, mass, retain_final=True
         )

@@ -7,16 +7,17 @@ Yet Another Universal Model
 
 **Explore Language Model Training Through the Lens of Classical Mechanics**
 
-This project provides a framework and application for training Language Models (currently character-level RNNs) using an approach inspired by Hamiltonian mechanics and the principle of least action. Instead of standard gradient descent on embeddings, we treat token embeddings as particles in a "Semantic Phase Space" evolving over training time according to Hamiltonian dynamics.
+This project provides a framework and application for training character-level language models using an approach inspired by Hamiltonian mechanics and the principle of least action. Instead of standard gradient descent on embeddings, we treat token embeddings as particles in a "Semantic Phase Space" evolving over training time according to Hamiltonian dynamics.
 
 **Key Features:**
 
 *   **Hamiltonian Dynamics:** Implements Leapfrog integration for updating token embeddings (`E`) and their corresponding momenta (`P`).
-*   **Configurable Physics:** Easily adjust parameters like timestep (`dt`) and token "mass" (based on frequency or uniform).
-*   **Standard + Hamiltonian:** Combines Hamiltonian updates for embeddings with standard optimizers (Adam) for the main model weights (RNN).
+*   **Configurable Physics:** Easily adjust timestep (`dt`), adaptive `dt` bounds, and token mass. New runs default to Fisher mass with frequency/uniform scalar mass still available.
+*   **Standard + Hamiltonian:** Combines Hamiltonian updates for embeddings with standard optimizers (Adam) for the main model weights.
+*   **Model-Agnostic Force Field:** Runs the same Hamiltonian substrate under RNN or Transformer sequence models.
 *   **Interactive UI:** A Gradio-based interface for easy configuration, data loading, training monitoring (progress, logs, plots), and text generation (inference).
 *   **Modular Structure:** Code organized into data handling, models, core dynamics, trainer logic, and UI for extensibility.
-*   **Checkpointing:** Save and load training state (model weights, embeddings, momenta, optimizer state) to resume runs.
+*   **Checkpointing:** Save and load training state (model weights, embeddings, momenta, optimizer state), including periodic snapshots and phase-shift snapshots.
 *   **Dual Licensed:** Offered under both Apache 2.0 and PolyForm Noncommercial 1.0.0 licenses (see below).
 
 **(Placeholder for a Screenshot/GIF of the Gradio UI)**
@@ -71,7 +72,7 @@ Any extra arguments are forwarded to `python -m yaum.ui.app`.
 
 1.  **Setup & Config Tab:**
     *   Enter the path to your training text file (`.txt`).
-    *   Adjust model architecture (embedding, RNN hidden dim, layers), Hamiltonian parameters (`dt`, mass type), and training settings (steps, batch size, learning rate).
+    *   Adjust model architecture (model family, embedding dim, hidden dim, layers), Hamiltonian parameters (`dt`, mass mode/type), snapshot cadence, and training settings (steps, batch size, learning rate).
     *   Optionally, provide a path to a checkpoint file to load.
     *   Click "Prepare Data & Model / Apply Config" to load data and initialize the trainer based on the current settings OR click "Load Checkpoint" to load a previous run. Check the status bar for confirmation or errors.
 2.  **Training Tab:**
@@ -100,7 +101,7 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 ## Future Directions
 
 *   Implement subword tokenization (BPE/SentencePiece).
-*   Integrate more advanced model architectures (Transformers).
+*   Integrate richer model architectures and substrate couplings.
 *   Explore different potential energy (`V`) formulations incorporating grammatical rules.
 *   Add more sophisticated UI features and visualizations.
 *   Rigorous comparison against standard training baselines.

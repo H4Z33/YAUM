@@ -50,6 +50,46 @@ CHAT_COMPACT_REJECTION_PATTERNS = (
     re.compile(r"\bas an ai\b", re.IGNORECASE),
     re.compile(r"\blanguage model\b", re.IGNORECASE),
 )
+CHAT_CREATIVE_INCLUDE_PATTERNS = (
+    re.compile(r"\bstory\b", re.IGNORECASE),
+    re.compile(r"\bbedtime\b", re.IGNORECASE),
+    re.compile(r"\bfiction\b", re.IGNORECASE),
+    re.compile(r"\bcharacter\b", re.IGNORECASE),
+    re.compile(r"\bpoem\b", re.IGNORECASE),
+    re.compile(r"\bcreative\b", re.IGNORECASE),
+    re.compile(r"\bimagine\b", re.IGNORECASE),
+    re.compile(r"\bfeel(?:ing|ings)?\b", re.IGNORECASE),
+    re.compile(r"\bsad\b", re.IGNORECASE),
+    re.compile(r"\banxious\b", re.IGNORECASE),
+    re.compile(r"\bfriend\b", re.IGNORECASE),
+    re.compile(r"\brelationship\b", re.IGNORECASE),
+    re.compile(r"\badvice\b", re.IGNORECASE),
+    re.compile(r"\bhelp me\b", re.IGNORECASE),
+    re.compile(r"\blistener\b", re.IGNORECASE),
+    re.compile(r"\bwrite\b", re.IGNORECASE),
+)
+CHAT_CREATIVE_EXCLUDE_PATTERNS = (
+    re.compile(r"\bgpu\b", re.IGNORECASE),
+    re.compile(r"\bcpu\b", re.IGNORECASE),
+    re.compile(r"\bpython\b", re.IGNORECASE),
+    re.compile(r"\bjavascript\b", re.IGNORECASE),
+    re.compile(r"\bcode\b", re.IGNORECASE),
+    re.compile(r"\bneural\b", re.IGNORECASE),
+    re.compile(r"\bmodel\b", re.IGNORECASE),
+    re.compile(r"\bopen assistant\b", re.IGNORECASE),
+    re.compile(r"\bchatgpt\b", re.IGNORECASE),
+    re.compile(r"\bsql\b", re.IGNORECASE),
+    re.compile(r"\blinux\b", re.IGNORECASE),
+    re.compile(r"\bwindows\b", re.IGNORECASE),
+    re.compile(r"\bcapital\b", re.IGNORECASE),
+    re.compile(r"\bdistance\b", re.IGNORECASE),
+    re.compile(r"\bhow tall\b", re.IGNORECASE),
+    re.compile(r"\bwhat year\b", re.IGNORECASE),
+    re.compile(r"\bwhen did\b", re.IGNORECASE),
+    re.compile(r"\bwho is\b", re.IGNORECASE),
+    re.compile(r"\bapi\b", re.IGNORECASE),
+    re.compile(r"\bhardware\b", re.IGNORECASE),
+)
 
 
 def _normalise_charset(text: str, charset: str) -> str:
@@ -232,6 +272,8 @@ def _build_chat_compact_corpus(
     min_user_quality: float,
     min_assistant_quality: float,
     max_toxicity: float,
+    include_patterns: tuple[re.Pattern[str], ...] = (),
+    exclude_patterns: tuple[re.Pattern[str], ...] = (),
 ) -> dict[str, object]:
     output.parent.mkdir(parents=True, exist_ok=True)
     seen_blocks: set[str] = set()
@@ -245,6 +287,16 @@ def _build_chat_compact_corpus(
             if not _is_alternating_chat_path(path, messages):
                 rejected["bad_path_shape"] += 1
                 continue
+            if include_patterns or exclude_patterns:
+                matched, reject_reason = _path_matches_patterns(
+                    path,
+                    messages,
+                    include_patterns=include_patterns,
+                    exclude_patterns=exclude_patterns,
+                )
+                if not matched:
+                    rejected[reject_reason or "profile_reject"] += 1
+                    continue
 
             passed = True
             for message_id in path:
@@ -303,6 +355,28 @@ def _build_chat_compact_corpus(
     }
 
 
+def _path_matches_patterns(
+    path: list[str],
+    messages: dict[str, dict],
+    *,
+    include_patterns: tuple[re.Pattern[str], ...],
+    exclude_patterns: tuple[re.Pattern[str], ...],
+) -> tuple[bool, str | None]:
+    include_hit = False
+    for message_id in path:
+        row = messages[message_id]
+        text = row["text"]
+        if row["role"] == "prompter" and any(
+            pattern.search(text) for pattern in include_patterns
+        ):
+            include_hit = True
+        if any(pattern.search(text) for pattern in exclude_patterns):
+            return False, "profile_exclude"
+    if not include_hit:
+        return False, "profile_include_miss"
+    return True, None
+
+
 def build_corpus(
     *,
     output: Path,
@@ -326,7 +400,12 @@ def build_corpus(
         filename=READY_MESSAGES,
     )
     messages = _load_messages(source, lang=lang, charset=charset)
-    if profile == "chat-compact":
+    if profile in {"chat-compact", "chat-creative"}:
+        include_patterns: tuple[re.Pattern[str], ...] = ()
+        exclude_patterns: tuple[re.Pattern[str], ...] = ()
+        if profile == "chat-creative":
+            include_patterns = CHAT_CREATIVE_INCLUDE_PATTERNS
+            exclude_patterns = CHAT_CREATIVE_EXCLUDE_PATTERNS
         return _build_chat_compact_corpus(
             messages=messages,
             output=output,
@@ -338,6 +417,8 @@ def build_corpus(
             min_user_quality=min_user_quality,
             min_assistant_quality=min_assistant_quality,
             max_toxicity=max_toxicity,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
         )
     children = _children_by_parent(messages)
     roots = _roots(messages)
@@ -393,9 +474,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--profile",
-        choices=["default", "chat-compact"],
+        choices=["default", "chat-compact", "chat-creative"],
         default="default",
-        help="Corpus shaping preset. 'chat-compact' keeps short recent chat windows.",
+        help="Corpus shaping preset. 'chat-compact' keeps short recent chat windows. 'chat-creative' keeps only creative/supportive chat windows.",
     )
     parser.add_argument(
         "--window-messages",

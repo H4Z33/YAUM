@@ -26,11 +26,12 @@ from ..models import make_model
 from .action import ActionAccumulator
 from .adaptive import AdaptiveStepController
 from .diagnostics import measure_reversibility
-from .dynamics import make_rnn_force_fn, total_hamiltonian
+from .dynamics import make_force_fn, total_hamiltonian
 from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
 from .integrators import make_integrator
 from .geometry import FisherMassConfig, FisherMassEstimator, fisher_diagonal_sample
 from .observables import ObservableWindow, snapshot
+from .substrate import HamiltonianSubstrate
 from .utils import device, get_batch
 
 
@@ -53,12 +54,42 @@ def _fmt_config_value(value):
     return str(value)
 
 
+TRAINER_DEFAULTS = {
+    "mass_mode": "fisher",
+    "adaptive_dt": True,
+    "dt_min": 0.00001,
+    "dt_max": 0.01,
+    "drift_high": 0.05,
+    "drift_low": 0.001,
+    "snapshot_interval": 5000,
+    "snapshot_keep_last": 100,
+    "snapshot_on_shift": True,
+    "snapshot_shift_cooldown": 5000,
+    "snapshot_shift_force_min": 5.0,
+    "snapshot_shift_force_ratio": 2.0,
+    "snapshot_shift_momentum_delta": 0.5,
+    "snapshot_shift_drift_delta": 0.25,
+    "snapshot_shift_susceptibility_min": 0.25,
+    "snapshot_shift_susceptibility_ratio": 2.0,
+    "reversibility_check_interval": 10,
+    "reversibility_check_steps": 5,
+}
+
+
+def _with_trainer_defaults(config: Mapping) -> dict:
+    merged = dict(TRAINER_DEFAULTS)
+    merged.update(config)
+    return merged
+
+
 class Trainer:
     def __init__(self, config):
-        self.config = config
+        self.config = _with_trainer_defaults(config)
+        config = self.config
         self.model = None
         self.E = None
         self.P = None
+        self.substrate: HamiltonianSubstrate | None = None
         self.optimizer_W = None
         self.criterion = torch.nn.CrossEntropyLoss()
         self.mass_vector = None
@@ -95,7 +126,12 @@ class Trainer:
         }
         self._eval_counter = 0
         self._energy_reference = None
-        self._current_dt: float = float(config["dt"]) if "dt" in config else 0.01
+        self._last_snapshot_step = 0
+        self._last_shift_snapshot_step = 0
+        initial_dt = float(config["dt"]) if "dt" in config else 0.01
+        self._current_dt: float = (
+            float(self.adaptive.dt) if self.adaptive is not None else initial_dt
+        )
         self._observables = ObservableWindow(
             size=int(config.get("observable_window", 32))
         )
@@ -132,6 +168,28 @@ class Trainer:
             grow_after=int(config.get("dt_grow_after", 10)),
         )
 
+    def _sync_substrate(self) -> None:
+        """Keep the explicit phase substrate aligned with trainer state."""
+        if self.E is None or self.P is None or self.mass_vector is None:
+            self.substrate = None
+            return
+        if self.substrate is None:
+            self.substrate = HamiltonianSubstrate(
+                E=self.E,
+                P=self.P,
+                mass=self.mass_vector,
+                integrator=self.integrator,
+                dt=self._current_dt,
+            )
+            return
+        self.substrate.E = self.E
+        self.substrate.P = self.P
+        self.substrate.configure(
+            mass=self.mass_vector,
+            integrator=self.integrator,
+            dt=self._current_dt,
+        )
+
     def effective_config_lines(self) -> list[str]:
         """Return the runtime settings that materially affect a train run."""
         lines = ["Effective trainer config:"]
@@ -157,8 +215,14 @@ class Trainer:
                     "eval_interval",
                     "eval_iters",
                     "eval_batch_size",
+                    "snapshot_interval",
+                    "snapshot_keep_last",
+                    "snapshot_on_shift",
+                    "snapshot_shift_cooldown",
                     "learning_rate_W",
                     "gradient_clip_norm_W",
+                    "reversibility_check_interval",
+                    "reversibility_check_steps",
                 ),
             ),
             (
@@ -249,15 +313,16 @@ class Trainer:
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Model instantiated with {n_params:,} params.")
 
-        self.E = torch.randn(
+        self.substrate = HamiltonianSubstrate.random(
             self.vocab_size,
             self.config["embedding_dim"],
+            mass=self.mass_vector,
+            integrator=self.integrator,
+            dt=float(self.config["dt"]),
             device=device,
-            requires_grad=True,
         )
-        self.P = torch.zeros(
-            self.vocab_size, self.config["embedding_dim"], device=device
-        )
+        self.E = self.substrate.E
+        self.P = self.substrate.P
         print(f"E: {self.E.shape}, P: {self.P.shape}")
 
         self.optimizer_W = optim.Adam(
@@ -295,7 +360,12 @@ class Trainer:
         self.current_step = 0
         self._stop_training_flag = False
         self._energy_reference = None
-        self._current_dt = float(self.config["dt"])
+        self.adaptive = self._build_adaptive_controller(self.config)
+        self._current_dt = (
+            float(self.adaptive.dt)
+            if self.adaptive is not None
+            else float(self.config["dt"])
+        )
         if self.adaptive is not None:
             self.adaptive.dt = self._current_dt
         default_sync = 1 if self._safe_speed else 20
@@ -304,6 +374,9 @@ class Trainer:
         )
         self._observables.clear()
         self._action.reset()
+        self._last_snapshot_step = 0
+        self._last_shift_snapshot_step = 0
+        self._sync_substrate()
         self.print_effective_config()
         print("Trainer setup complete.")
 
@@ -359,7 +432,7 @@ class Trainer:
             for p in self.model.parameters():
                 p.requires_grad_(False)
             try:
-                force_fn = make_rnn_force_fn(
+                force_fn = make_force_fn(
                     x_batch, y_batch, self.model, self.criterion
                 )
                 residual = measure_reversibility(
@@ -381,16 +454,11 @@ class Trainer:
 
     def _step_embeddings(self, x_batch, y_batch):
         """Run one integrator step and return (new_E, new_P, loss1, loss2)."""
-        force_fn = make_rnn_force_fn(x_batch, y_batch, self.model, self.criterion)
-
-        step = self.integrator.step(
-            self.E,
-            self.P,
-            self._current_dt,
-            force_fn,
-            self.mass_vector,
-            retain_final=True,
-        )
+        force_fn = make_force_fn(x_batch, y_batch, self.model, self.criterion)
+        self._sync_substrate()
+        if self.substrate is None:
+            raise RuntimeError("Hamiltonian substrate is not initialized.")
+        step = self.substrate.propose(force_fn, retain_final=True)
         return step.E, step.P, step.loss_initial, step.loss_final
 
     def train(self):
@@ -460,6 +528,9 @@ class Trainer:
             self.optimizer_W.step()
             self.E = E_new.detach().requires_grad_(True)
             self.P = P_new.detach()
+            if self.substrate is not None:
+                self.substrate.E = self.E
+                self.substrate.P = self.P
             self.current_step = step + 1
             self._breathe(step)
 
@@ -552,6 +623,8 @@ class Trainer:
                 "history": self.get_history(),
             }
             self.save_checkpoint()
+            self._maybe_save_snapshot()
+            self._maybe_save_shift_snapshot()
 
 
         if not self._stop_training_flag:
@@ -633,7 +706,122 @@ class Trainer:
         )
         return {"test_loss": avg_loss}
 
-    def save_checkpoint(self, filename="checkpoint_latest.pt"):
+    def _snapshot_filenames(self) -> list[str]:
+        if not os.path.isdir(self.save_dir):
+            return []
+        names = []
+        for name in os.listdir(self.save_dir):
+            if name.startswith("checkpoint_step_") and name.endswith(".pt"):
+                names.append(name)
+        return sorted(names)
+
+    def _prune_snapshots(self) -> None:
+        keep_last = int(self.config.get("snapshot_keep_last", 0) or 0)
+        if keep_last <= 0:
+            return
+        names = self._snapshot_filenames()
+        stale = names[:-keep_last]
+        for name in stale:
+            path = os.path.join(self.save_dir, name)
+            try:
+                os.remove(path)
+            except OSError as e:
+                print(f"Warning: Could not prune snapshot {path}: {e}")
+
+    @staticmethod
+    def _finite(value: float | None) -> bool:
+        return value is not None and np.isfinite(float(value))
+
+    def _phase_shift_reason(self) -> str | None:
+        if not bool(self.config.get("snapshot_on_shift", False)):
+            return None
+        if len(self.debug_stats["H_drift"]) < 2:
+            return None
+
+        cur = {key: self.debug_stats[key][-1] for key in self.debug_stats}
+        prev = {key: self.debug_stats[key][-2] for key in self.debug_stats}
+        reasons = []
+
+        force_min = float(self.config.get("snapshot_shift_force_min", 5.0))
+        force_ratio = float(self.config.get("snapshot_shift_force_ratio", 2.0))
+        cur_f = cur.get("force_E")
+        prev_f = prev.get("force_E")
+        if (
+            self._finite(cur_f)
+            and self._finite(prev_f)
+            and float(prev_f) > 1e-12
+            and float(cur_f) >= force_min
+            and float(cur_f) / float(prev_f) >= force_ratio
+        ):
+            reasons.append("force_jump")
+
+        p_delta = float(self.config.get("snapshot_shift_momentum_delta", 0.5))
+        cur_p = cur.get("P_norm")
+        prev_p = prev.get("P_norm")
+        if (
+            self._finite(cur_p)
+            and self._finite(prev_p)
+            and abs(float(cur_p) - float(prev_p)) >= p_delta
+        ):
+            reasons.append("momentum_jump")
+
+        drift_delta = float(self.config.get("snapshot_shift_drift_delta", 0.25))
+        cur_h = cur.get("H_drift")
+        prev_h = prev.get("H_drift")
+        if (
+            self._finite(cur_h)
+            and self._finite(prev_h)
+            and abs(float(cur_h) - float(prev_h)) >= drift_delta
+        ):
+            reasons.append("drift_jump")
+
+        chi_ratio = float(self.config.get("snapshot_shift_susceptibility_ratio", 2.0))
+        chi_min = float(self.config.get("snapshot_shift_susceptibility_min", 0.25))
+        cur_chi = cur.get("susceptibility")
+        prev_chi = prev.get("susceptibility")
+        if (
+            self._finite(cur_chi)
+            and self._finite(prev_chi)
+            and float(prev_chi) > 1e-12
+            and float(cur_chi) >= chi_min
+            and float(cur_chi) / float(prev_chi) >= chi_ratio
+        ):
+            reasons.append("susceptibility_jump")
+
+        if not reasons:
+            return None
+        return "_".join(reasons[:2])
+
+    def _maybe_save_shift_snapshot(self) -> None:
+        reason = self._phase_shift_reason()
+        if reason is None:
+            return
+        cooldown = int(self.config.get("snapshot_shift_cooldown", 0) or 0)
+        if (
+            cooldown > 0
+            and self.current_step - self._last_shift_snapshot_step < cooldown
+        ):
+            return
+        filename = f"checkpoint_shift_{self.current_step:08d}_{reason}.pt"
+        self.save_checkpoint(filename, kind="phase_shift")
+        self._last_shift_snapshot_step = self.current_step
+
+    def _maybe_save_snapshot(self) -> None:
+        interval = int(self.config.get("snapshot_interval", 0) or 0)
+        if interval <= 0 or self.current_step <= 0:
+            return
+        is_final = self.current_step >= int(self.config.get("num_steps", 0))
+        if (
+            not is_final
+            and self.current_step - self._last_snapshot_step < interval
+        ):
+            return
+        filename = f"checkpoint_step_{self.current_step:08d}.pt"
+        self.save_checkpoint(filename, kind="snapshot")
+        self._last_snapshot_step = self.current_step
+        self._prune_snapshots()
+
+    def save_checkpoint(self, filename="checkpoint_latest.pt", *, kind="latest"):
         if not self.model or self.E is None or self.optimizer_W is None:
             print("Warning: Cannot save checkpoint, trainer not fully initialized.")
             return
@@ -644,6 +832,7 @@ class Trainer:
         integrity = compute_integrity(E_cpu, P_cpu, mass_cpu)
         state = {
             "step": self.current_step,
+            "checkpoint_kind": kind,
             "config": self.config,
             "vocab_size": self.vocab_size,
             "model_state_dict": _to_cpu_state(self.model.state_dict()),
@@ -692,7 +881,15 @@ class Trainer:
                     return False
                 print(report.format())
 
-            self.config = checkpoint["config"]
+            loaded_config = dict(checkpoint["config"])
+            self.config = _with_trainer_defaults(loaded_config)
+            if (
+                "mass_mode" not in loaded_config
+                and "mass_vector" in checkpoint
+                and checkpoint["mass_vector"] is not None
+                and tuple(checkpoint["mass_vector"].shape) != tuple(checkpoint["E"].shape)
+            ):
+                self.config["mass_mode"] = "static"
             self.vocab_size = checkpoint["vocab_size"]
             self.char_to_idx = checkpoint["char_to_idx"]
             self.idx_to_char = checkpoint["idx_to_char"]
@@ -752,13 +949,18 @@ class Trainer:
                 loaded_debug.setdefault(key, [float("nan")] * n)
             self.debug_stats = loaded_debug
             self.adaptive = self._build_adaptive_controller(self.config)
-            self._current_dt = float(self.config["dt"])
-            if self.adaptive is not None:
-                self.adaptive.dt = self._current_dt
+            self._current_dt = (
+                float(self.adaptive.dt)
+                if self.adaptive is not None
+                else float(self.config["dt"])
+            )
             self.save_dir = os.path.dirname(filepath)
             self._energy_reference = None
             self._observables.clear()
             self._action.reset()
+            self._last_snapshot_step = self.current_step
+            self._last_shift_snapshot_step = self.current_step
+            self._sync_substrate()
 
             print(f"Checkpoint loaded. Resuming from step {self.current_step}")
             return True
