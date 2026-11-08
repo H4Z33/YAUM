@@ -19,11 +19,31 @@ scientific soundness) found the problems below; all are fixed in commits
 ### Lessons
 
 0. **The first result that bears on the real thesis came from moving the
-   physics into context time.** On synthetic tasks, a Hamiltonian hidden
-   state with learned friction matched or beat an LSTM, and the friction
-   it learned ordered the tasks by how much forgetting they need. One
-   registered prediction (count wants γ ≈ 0) was wrong. Keep registering
-   predictions; the wrong one taught the most.
+   physics into context time.** A Hamiltonian hidden state with learned
+   friction learns usable memory, and the friction it learns orders the
+   tasks by how much forgetting they need. That part survived 3 seeds.
+   The "beats the LSTM on long recall" part did **not**; see 0b.
+
+0b. **Baselines can fail for initialisation reasons, too.** The LSTM sat at
+   chance on 40-step recall across 12 lr/steps/size settings. Every one of
+   them used PyTorch's default forget gate (≈ 0.5 per step, so 0.5⁴⁰ of the
+   memory survives). Forget bias 1.0 still failed; 3.0 solved it in every
+   setting. "Tune the baseline" means its *initialisation* as well as its
+   learning rate. A baseline stuck at exactly chance everywhere is a red
+   flag, not a result.
+
+0c. **Coupled dynamics can be untrainable even when the physics is right.**
+   The dynamic-geometry model passes every physics test (exact gradients,
+   energy conservation, reversibility, bounded energy). It still trains
+   badly: gradient norms ~1e3 with spikes to 1e5, versus ~2 for the static
+   model. Backprop through a chaotic system explodes. Check gradient norms
+   in the first 100 steps of any new dynamics before running the full
+   benchmark.
+
+0d. **An unbounded coupling collapses.** The first geometry draft let φ
+   scale the unbounded `log cosh`, so the joint energy had no lower bound
+   (energy 1e34 in tests). Couplings between subsystems need bounded
+   features, or a stiffness proven to dominate.
 
 1. **A diagnostic can be precise and still measure the wrong thing.**
    `|ΔH/H|` was computed against the first eval's `H`. Since `H ≈ loss`,
@@ -111,8 +131,27 @@ hash instead of deleting them.
       `docs/ARTICLE.md` §4. Learned γ: recall 0.036 < count 0.15 < lag 0.24.
       Hypothesis supported on recall and lag, **wrong on count**: discrete
       bounded state seems to need attractors, so it needs dissipation.
-- [ ] **Tune the LSTM** (lr sweep, more steps) on `recall_first` before
-      claiming any long-memory advantage. It stayed at chance untuned.
+- [x] Tune the LSTM on `recall_first`: forget bias 3 solves it; the
+      long-memory advantage is gone (ARTICLE §6 corrections table).
+- [x] Third seed for the context table (results unchanged).
+- [x] Dynamic geometry, version A (bending resets every sequence):
+      `geometry="dynamic"`. Registered hypothesis **not supported**: it ties
+      on `assoc` and trains badly elsewhere (exploding gradients).
+- [ ] **Many-body model** (owner's idea, ARTICLE §4.1): every token is a
+      particle with momentum; learned, content-dependent pair attraction
+      and repulsion (symmetric, Newton's third law); clusters as composite
+      objects. Pre-register: beats single-particle models on `assoc` and
+      learns γ > 0 there. Tests: total momentum and energy conserved
+      without friction, reversibility.
+- [ ] Stabilise dynamic geometry before judging the idea: weaker initial
+      coupling (scale tanh² by a learned ε ≈ 0.1), heavier/stiffer geometry
+      (slower timescale), smaller `dt`, truncated backprop, gradient-norm
+      monitoring.
+- [ ] **Version B / persistent universe** (owner, 2026-11-08): keep the
+      bent geometry or particle state between sessions, possibly as a
+      saved phase-state *cache* to resume from instead of textual
+      compaction. Watch for drift and forgetting (continual-learning risks).
+- [ ] Param-matched LSTM with forget bias 3 (hidden 44) on all tasks.
 - [ ] Test the "discrete state needs attractors" reading of `count`, e.g.
       unbounded counting (no clipping) should want less γ than bounded.
 - [ ] Per-mode analysis: with learned γ, do some modes go to ~0 (memory)

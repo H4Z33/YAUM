@@ -17,3 +17,78 @@ Appended by `python -m benchmarks.context_dynamics`.
 | lag | `ham_learned` | 0.995 ± 0.001 | 11,208 | 0.240 (0.363) | 91 |
 
 Chance accuracy: recall_first 0.125, lag 0.125, count ≈ 0.2. Learned γ starts at 0.05.
+
+<!-- The runs below were made in scratch files and appended after review. -->
+
+### Seed 2 for the first table (PyTorch-default LSTM init)
+## Run steps=1500 T=40 hidden=64 substeps=2 dt=0.5 seeds=[2]
+
+| task | model | accuracy | params | learned γ median (90th pct) | wall (s) |
+|---|---|---:|---:|---:|---:|
+| recall_first | `lstm` | 0.117 ± 0.000 | 21,768 | — | 9 |
+| recall_first | `ham_conservative` | 1.000 ± 0.000 | 11,144 | — | 91 |
+| recall_first | `ham_learned` | 1.000 ± 0.000 | 11,208 | 0.034 (0.043) | 97 |
+| count | `lstm` | 1.000 ± 0.000 | 21,768 | — | 12 |
+| count | `ham_conservative` | 0.777 ± 0.000 | 11,144 | — | 89 |
+| count | `ham_learned` | 1.000 ± 0.000 | 11,208 | 0.157 (0.230) | 98 |
+| lag | `lstm` | 1.000 ± 0.000 | 21,768 | — | 10 |
+| lag | `ham_conservative` | 0.947 ± 0.000 | 11,144 | — | 104 |
+| lag | `ham_learned` | 0.997 ± 0.000 | 11,208 | 0.228 (0.325) | 857 |
+
+Chance accuracy: recall_first 0.125, lag 0.125, count ≈ 0.2. Learned γ starts at 0.05.
+## Run steps=1500 T=40 hidden=64 substeps=2 dt=0.5 seeds=[0, 1, 2] lstm_forget_bias=1.0
+
+| task | model | accuracy | params | learned γ median (90th pct) | geometry γ / stiffness λ | wall (s) |
+|---|---|---:|---:|---:|---:|---:|
+| assoc | `lstm` | 0.569 ± 0.068 | 21,768 | — | — | 6 |
+| assoc | `ham_conservative` | 0.398 ± 0.013 | 11,144 | — | — | 24 |
+| assoc | `ham_learned` | 0.399 ± 0.014 | 11,208 | 0.085 (0.106) | — | 25 |
+| assoc | `ham_geometry` | 0.404 ± 0.007 | 11,592 | 0.065 (0.089) | 0.054 / 0.983 | 44 |
+
+Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. Learned γ starts at 0.05.
+## Run steps=1500 T=40 hidden=64 substeps=2 dt=0.5 seeds=[0, 1, 2] lstm_forget_bias=1.0
+
+| task | model | accuracy | params | learned γ median (90th pct) | geometry γ / stiffness λ | wall (s) |
+|---|---|---:|---:|---:|---:|---:|
+| recall_first | `lstm` | 0.120 ± 0.012 | 21,768 | — | — | 10 |
+| recall_first | `ham_geometry` | 0.318 ± 0.272 | 11,592 | 0.047 (0.054) | 0.050 / 0.996 | 243 |
+| count | `lstm` | 1.000 ± 0.000 | 21,768 | — | — | 13 |
+| count | `ham_geometry` | 0.277 ± 0.003 | 11,592 | 0.056 (0.067) | 0.052 / 1.001 | 216 |
+| lag | `lstm` | 1.000 ± 0.000 | 21,768 | — | — | 11 |
+| lag | `ham_geometry` | 0.516 ± 0.033 | 11,592 | 0.052 (0.061) | 0.051 / 1.001 | 216 |
+
+Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. Learned γ starts at 0.05.
+
+### LSTM forget-gate bias = 3.0 (tuned baseline)
+## Run steps=1500 T=40 hidden=64 substeps=2 dt=0.5 seeds=[0, 1, 2] lstm_forget_bias=3.0
+
+| task | model | accuracy | params | learned γ median (90th pct) | geometry γ / stiffness λ | wall (s) |
+|---|---|---:|---:|---:|---:|---:|
+| recall_first | `lstm` | 1.000 ± 0.000 | 21,768 | — | — | 9 |
+| count | `lstm` | 1.000 ± 0.000 | 21,768 | — | — | 12 |
+| lag | `lstm` | 1.000 ± 0.000 | 21,768 | — | — | 10 |
+| assoc | `lstm` | 0.688 ± 0.040 | 21,768 | — | — | 4 |
+
+Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. Learned γ starts at 0.05.
+
+### LSTM tuning on recall_first (3 seeds each)
+
+| forget bias | hidden | steps | lr | accuracy |
+|---|---:|---:|---:|---:|
+| PyTorch default | 64 / 44 | 1500 / 6000 | 1e-3, 3e-3, 1e-2 | 0.114–0.128 (all 12 settings) |
+| 1.0 | 64 | 1500 / 6000 | 3e-3, 1e-2 | 0.118–0.121 |
+| 3.0 | 64 | 1500 / 6000 | 3e-3, 1e-2 | **1.000** (all settings) |
+
+### Consolidated, 3 seeds (Hamiltonian rows: seeds 0, 1 from the first run + seed 2)
+
+| task | LSTM (forget bias 3) | ham_conservative | ham_learned | ham_geometry | learned γ (ham_learned) |
+|---|---:|---:|---:|---:|---:|
+| recall_first | **1.000 ± 0.000** | **1.000 ± 0.000** | **1.000 ± 0.000** | 0.318 ± 0.272 | 0.035 |
+| count | **1.000 ± 0.000** | 0.738 ± 0.051 | **1.000 ± 0.000** | 0.277 ± 0.003 | 0.153 |
+| lag | **1.000 ± 0.000** | 0.934 ± 0.012 | 0.996 ± 0.002 | 0.516 ± 0.033 | 0.236 |
+| assoc | **0.688 ± 0.040** | 0.398 ± 0.013 | 0.399 ± 0.014 | 0.404 ± 0.007 | 0.085 |
+
+`ham_geometry` gradient norms during training: median ~1e3 (vs ~2 for
+`ham_learned`), spikes to 1e5. The coupled matter–geometry dynamics make
+backpropagation explode, and the geometry parameters barely move from
+their initial values (γ_Φ 0.05 → 0.054, λ 1.0 → 0.98).

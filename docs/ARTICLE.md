@@ -182,54 +182,87 @@ ordinary `nn.Embedding` on three synthetic tasks:
 near zero on `recall_first` and `count` and grows on `lag`; the
 conservative model does well on the first two and worst on `lag`.
 
-### Results (1500 steps, T = 40, hidden 64, 2 seeds)
+### Results (1500 steps, T = 40, hidden 64, 3 seeds)
 
-| task | LSTM | Hamiltonian, γ = 0 | Hamiltonian, learned γ | learned γ median (90th pct) |
-|---|---:|---:|---:|---:|
-| `recall_first` | 0.116 ± 0.003 | **1.000** | **1.000** | 0.036 (0.043) |
-| `count` | **1.000** | 0.719 ± 0.056 | **1.000** | 0.150 (0.302) |
-| `lag` | **1.000** | 0.928 ± 0.003 | 0.995 ± 0.001 | 0.240 (0.363) |
+Accuracy on 1024 fresh sequences. Chance is 0.125, except ≈ 0.2 for
+`count`. The LSTM uses a forget-gate bias of 3, the setting that makes it
+a fair baseline (see below). Parameters: LSTM 21.8k, Hamiltonian models
+11.2–11.6k. Raw runs are in `benchmarks/context_dynamics_results.md`.
 
-Accuracy on 1024 fresh sequences. Chance is 0.125 for `recall_first` and
-`lag`. The LSTM has 21.8k parameters, the Hamiltonian models 11.2k. Learned
-γ starts at 0.05. Raw output is in `benchmarks/context_dynamics_results.md`.
+| task | LSTM | Ham., γ = 0 | Ham., learned γ | Ham. + dynamic geometry | learned γ |
+|---|---:|---:|---:|---:|---:|
+| `recall_first` | **1.000** | **1.000** | **1.000** | 0.318 ± 0.272 | 0.035 |
+| `count` | **1.000** | 0.738 ± 0.051 | **1.000** | 0.277 ± 0.003 | 0.153 |
+| `lag` | **1.000** | 0.934 ± 0.012 | 0.996 ± 0.002 | 0.516 ± 0.033 | 0.236 |
+| `assoc` | **0.688 ± 0.040** | 0.398 ± 0.013 | 0.399 ± 0.014 | 0.404 ± 0.007 | 0.085 |
 
-**What happened compared with the registered hypothesis:**
+**What held up:**
 
-1. **The friction separates the tasks.** Learned γ ends up ordered
-   `recall_first` (0.036, *below* its 0.05 start) < `count` (0.15) <
-   `lag` (0.24), and is consistent across seeds. When the model can
-   choose, it chooses almost no dissipation for lossless memory and the
-   most dissipation for the task that needs forgetting. **Supported.**
-2. **`count` went against the prediction.** It was expected to want
-   γ ≈ 0, since accumulation is what momentum does naturally. Instead the
-   conservative model scored worst there (0.72) and the learned model
-   raised γ to 0.15 to reach 1.00. A plausible reading: the depth is a
-   *discrete*, bounded state, and holding a discrete state robustly needs
-   attractors (wells you settle into), which only dissipation provides.
-   Pure accumulation drifts. **Hypothesis wrong on this task.**
-3. **`lag`**: conservative is worst-but-close (0.93), learned γ is
-   highest, as predicted. **Supported.**
-4. **Long memory:** on `recall_first` both Hamiltonian models are perfect
-   while the LSTM stays at chance. **Caveat:** an LSTM can solve 40-step
-   recall with more steps or a tuned learning rate; it was *not* tuned
-   here (lr 3e-3, 1500 steps for every model). This shows the
-   Hamiltonian state learns long recall *quickly and robustly*. It does
-   not show that LSTMs can't.
+1. **The learned friction orders the tasks** by how much forgetting or
+   settling they need. Across all three seeds: `recall_first` 0.035
+   (*below* its 0.05 start) < `assoc` 0.085 < `count` 0.153 < `lag`
+   0.236. When it can choose, the model keeps lossless memory nearly
+   conservative and adds dissipation where old information must fade.
+2. **Purely conservative is never best.** The γ = 0 model is the weakest
+   static Hamiltonian variant wherever there is a difference. This
+   supports "conservative core + controlled dissipation" over "purely
+   Hamiltonian".
+3. A single moving phase point, with half the LSTM's parameters, solves
+   long recall, bounded counting and lag copying.
 
-**Caveats that bound these claims:** synthetic tasks, short sequences,
-2 seeds, an untuned LSTM, unmatched parameter counts, and a Hamiltonian
-model about 10× slower per step (a Python loop over tokens). The next
-experiments are listed in `docs/LESSONS.md`.
+**What did not:**
 
-**What it means for the thesis:** this is the first result in the project
-that bears on the actual idea. A model whose state obeys mechanical
-rules learns a usable memory, and the one degree of freedom left
-open — how much energy to dissipate — gets set differently by each task,
-in a direction that mostly matches the physics intuition. "Conservative
-core plus controlled dissipation" looks like the right framing; "purely
-Hamiltonian" does not: the γ = 0 model is the worst Hamiltonian variant
-on two of the three tasks.
+4. **No advantage over a fair LSTM.** The first runs showed the LSTM at
+   chance on `recall_first` while the Hamiltonian models were perfect. That
+   gap came from PyTorch's LSTM initialisation: a forget gate ≈ 0.5
+   erases a 40-step memory (0.5⁴⁰ ≈ 1e-12). With the standard fix, a
+   forget-gate bias of 3, the LSTM solves `recall_first` in every setting
+   tried. With that baseline, the LSTM matches or beats every Hamiltonian
+   variant on every task. On `assoc` it leads clearly (0.69 vs 0.40).
+5. **The `count` prediction was wrong.** It was expected to want γ ≈ 0
+   (accumulation is what momentum does). It wanted 0.15. A guess: a
+   discrete, bounded state needs attractors, which only dissipation
+   provides. Untested.
+6. **Dynamic geometry failed as implemented, and the second registered
+   hypothesis is not supported.** On `assoc` it ties the static model
+   (0.404 vs 0.399) instead of beating it. On the other tasks it is
+   *much* worse. The diagnosis is a training pathology, not a verdict on
+   the idea: the coupled matter–geometry dynamics make gradients explode
+   (median norm ~1e3 vs ~2, spikes to 1e5), and the geometry parameters
+   hardly move from their initial values. A coupled nonlinear system like
+   this is prone to chaos (positive Lyapunov exponents), and
+   backpropagating through chaos is exactly where gradients explode.
+   Taming it (weaker initial coupling, slower and stiffer geometry,
+   smaller `dt`, truncated backprop) is the next step if the idea is
+   pursued.
+7. **One particle is probably the real bottleneck on `assoc`.** Every
+   Hamiltonian model here compresses the whole context into the motion of
+   *one* point. Storing several bindings in one trajectory is hard,
+   whether or not the landscape bends. The next design (§4.1) makes every
+   token its own particle.
+
+**Caveats:** synthetic tasks, short sequences, unmatched parameter
+counts, and a Hamiltonian model about 10× slower per step (Python loop
+over tokens).
+
+### 4.1 Next: a many-body universe
+
+Instead of one particle in a (possibly bending) landscape, every token
+becomes a particle that stays in the system, with its own position and
+momentum. Particles attract or repel each other through a learned,
+content-dependent pair interaction:
+
+```
+H = Σᵢ |pᵢ|²/2m + Σᵢ U(qᵢ) + Σᵢ<ⱼ φ(qᵢ, qⱼ)
+```
+
+Clusters such as bound key–value pairs can then form as composite
+objects ("particles forming particles"). The query enters as a new
+particle and is pulled toward its matching cluster. Compared with
+attention, the forces are symmetric (Newton's third law, so total momentum
+is conserved), second-order (particles carry momentum), and derived from
+one total energy. The open question is whether a conservative,
+momentum-carrying, symmetric interaction can do what attention does.
 
 ---
 
@@ -262,6 +295,7 @@ on two of the three tasks.
 | "leapfrog and yoshida4 agree to float32 precision" | True, but only because the forces were too small to move `E` at all. |
 | "checkpoint fingerprint is sensitive to any tampering" | No: anyone can recompute three norms. It catches corruption. Security comes from `weights_only=True` loading. |
 | "None of this is available to SGD/Adam, which forgets everything" | Adam keeps momentum and second-moment state; heavy-ball with an RMS mass is close kin to it. |
+| (first context-time run) "Hamiltonian models solve long recall where the LSTM stays at chance" | Artefact of PyTorch's LSTM forget-gate init. With forget bias 3 the LSTM solves it too, and it matches or beats the Hamiltonian models on every task. |
 
 ---
 

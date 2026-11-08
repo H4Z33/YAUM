@@ -20,7 +20,7 @@ The physics lives in two places, and keeping them apart is essential:
 | clock | optimiser steps | tokens read |
 | what moves | embedding table `E` (with momentum `P`, mass `m`) | hidden state `(q, p)` |
 | code | `yaum/core/` (trainer, integrators) | `yaum/models/hamiltonian.py` |
-| status | works; ties a tuned Adam on `E` | new; under evaluation |
+| status | works; ties a tuned Adam on `E` | learns memory, learned friction is informative; a fair LSTM still matches or beats it |
 
 The owner's thesis is mostly about **context time** ("a model builds a
 small universe that moves with context as time"). Training-time physics
@@ -111,8 +111,13 @@ scratch runs so you don't pollute the record.
 
 1. **Controls**: include the trivial baseline (e.g. `frozen_E`) so you
    know whether the mechanism does anything at all.
-2. **Tuned baselines**: sweep the baseline's learning rate before saying
-   YAUM beats it. An untuned Adam will flatter anything.
+2. **Tuned baselines**: sweep the baseline's learning rate *and check its
+   initialisation* before saying YAUM beats it. An untuned Adam, or an LSTM
+   with PyTorch's default forget gate (use forget bias ≥ 1, 3 for long gaps),
+   will flatter anything. A baseline stuck at exactly chance is a red flag.
+7. **Check gradient norms** in the first ~100 steps of any new dynamics.
+   Coupled or chaotic dynamics can pass every physics test and still be
+   untrainable.
 3. **Seeds**: ≥ 3, report mean ± std. Call differences inside seed noise a tie.
 4. **Fixed evaluation set**: identical held-out windows for all variants.
 5. **Pre-register** the hypothesis in the benchmark docstring *before*

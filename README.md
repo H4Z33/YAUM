@@ -32,13 +32,15 @@ results — including the ones that did not go the project's way.
   *tuned* Adam on the same embeddings (held-out loss 0.170 vs 0.171, seed std
   0.007) and clearly beat leaving `E` frozen (0.221). They do not beat Adam.
   See `benchmarks/results.md`.
-* **Context time.** On three synthetic tasks, a Hamiltonian hidden state
-  with learned per-mode friction reaches 1.00 / 1.00 / 0.995 accuracy
-  (long recall / bounded counting / lag-5 copy). The purely conservative
-  version is worse on two of the three. The learned friction orders the
-  tasks by how much forgetting they need (0.036 < 0.15 < 0.24). An untuned
-  LSTM stays at chance on long recall, so that comparison is not settled.
-  See `docs/ARTICLE.md` §4.
+* **Context time.** A Hamiltonian hidden state with learned per-mode
+  friction solves long recall, bounded counting and lag copying on
+  synthetic tasks (1.00 / 1.00 / 0.996, 3 seeds), and the friction it
+  learns orders the tasks by how much forgetting they need
+  (0.035 < 0.085 < 0.15 < 0.24). A fairly initialised LSTM matches or
+  beats it everywhere, though, and clearly on in-context key→value binding
+  (0.69 vs 0.40). A first "dynamic geometry" version failed to train
+  (exploding gradients). Next is a many-body version where every token is
+  a particle. See `docs/ARTICLE.md` §4.
 
 ## Key features
 
