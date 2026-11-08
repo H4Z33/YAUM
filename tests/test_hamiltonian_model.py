@@ -143,3 +143,102 @@ def test_trainer_runs_the_hamiltonian_model_end_to_end(tmp_path):
     assert len(trainer.generate("ab", 5, 1.0)) == 7
     path = os.path.join(trainer.save_dir, "checkpoint_latest.pt")
     assert Trainer({"results_dir": str(tmp_path)}).load_checkpoint(path) is True
+
+
+# ---- dynamic geometry ------------------------------------------------------
+
+def _geo_model(dissipation="none", **kw):
+    torch.manual_seed(0)
+    return HamiltonianCharModel(
+        vocab_size=7, embedding_dim=5, hidden_dim=8, n_layers=2,
+        dissipation=dissipation, geometry="dynamic", **kw,
+    )
+
+
+def _joint_state(model, batch=4, scale=1.0):
+    q, p = _random_state(model, batch, scale)
+    phi = 0.1 * torch.randn(batch, model.n_potential)
+    pi = 0.1 * torch.randn(batch, model.n_potential)
+    return q, p, phi, pi
+
+
+def test_dynamic_geometry_forward_shapes_and_rest_start():
+    model = _geo_model()
+    h0 = model.init_hidden(3)
+    assert len(h0) == 4
+    assert torch.all(h0[2] == 0) and torch.all(h0[3] == 0)  # starts unbent, at rest
+    logits, (_q, _p, phi, pi) = model(torch.randn(3, 6, 5), h0)
+    assert logits.shape == (3, 6, 7)
+    assert phi.shape == pi.shape == (3, model.n_potential)
+
+
+def test_geometry_force_is_exact_gradient_of_joint_energy():
+    model = _geo_model()
+    q, p, phi, pi = _joint_state(model)
+    phi = phi.requires_grad_(True)
+    (auto,) = torch.autograd.grad(model.energy(q, p, phi, pi).sum(), phi)
+    assert torch.allclose(model.geometry_force(q, phi), -auto, atol=1e-5)
+
+
+def test_joint_flow_conserves_joint_energy_without_friction():
+    model = _geo_model("none", dt=0.05)
+    q, p, phi, pi = _joint_state(model)
+    with torch.no_grad():
+        H0 = model.energy(q, p, phi, pi)
+        worst = 0.0
+        for _ in range(20):
+            q, p, phi, pi = model.flow(q, p, 50, phi=phi, pi=pi)
+            H = model.energy(q, p, phi, pi)
+            worst = max(worst, float(((H - H0).abs() / H0.abs()).max()))
+    assert worst < 1e-2
+
+
+def test_joint_flow_is_time_reversible():
+    model = _geo_model("none", dt=0.1)
+    s0 = _joint_state(model)
+    with torch.no_grad():
+        s = model.flow(*s0[:2], 100, phi=s0[2], pi=s0[3])
+        s = model.flow(*s[:2], 100, dt=-0.1, phi=s[2], pi=s[3])
+    for a, b in zip(s, s0):
+        assert torch.allclose(a, b, atol=1e-3)
+
+
+def test_content_bends_the_geometry():
+    """Different inputs must leave the landscape in different shapes."""
+    model = _geo_model("none")
+    with torch.no_grad():
+        _, (_, _, phi_a, _) = model(torch.randn(1, 8, 5) * 2, None)
+        _, (_, _, phi_b, _) = model(torch.randn(1, 8, 5) * 2, None)
+        _, (_, _, phi_0, _) = model(torch.zeros(1, 8, 5), None)
+    assert phi_a.abs().max() > 1e-2
+    assert (phi_a - phi_b).abs().max() > 1e-2
+    # No matter moving (q stays at 0, z = b = 0, tanh² 0 = 0): no bending.
+    assert torch.allclose(phi_0, torch.zeros_like(phi_0), atol=1e-6)
+
+
+def test_joint_energy_is_bounded_below():
+    """Regression for the 'gravitational collapse' of the first design."""
+    model = _geo_model("none")
+    with torch.no_grad():
+        q = torch.randn(256, model.hidden_dim) * 20
+        phi = -torch.rand(256, model.n_potential) * 50
+        H = model.energy(q, torch.zeros_like(q), phi, torch.zeros_like(phi))
+        static_floor = model.potential(q).min()
+        bound = static_floor - (1.0 / (2.0 * model.stiffness)).sum()
+    assert torch.all(H >= bound - 1e-3)
+
+
+def test_geometry_parameters_receive_gradient():
+    model = _geo_model("learned")
+    logits, _ = model(torch.randn(2, 5, 5), None)
+    logits.sum().backward()
+    for name in ("_stiffness", "_geom_mass", "_rho_geom", "a"):
+        grad = getattr(model, name).grad
+        assert grad is not None and grad.abs().sum() > 0, name
+
+
+def test_static_geometry_is_unchanged_by_default():
+    assert _model().geometry == "static"
+    assert len(_model().init_hidden(2)) == 2
+    with pytest.raises(ValueError):
+        _model(geometry="curved")

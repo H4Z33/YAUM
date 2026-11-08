@@ -41,6 +41,44 @@ dissipative part). ``dissipation`` selects:
 With ``"learned"``, the trained ``γ`` *is* an experimental result: it says
 how much conservation the task wants. ``n_layers`` in the shared config
 is reused as ``n_substeps``.
+
+Dynamic geometry (``geometry="dynamic"``)
+-----------------------------------------
+With static geometry the landscape ``V`` is fixed after training: the state
+moves through it, but nothing it reads bends it. ``geometry="dynamic"``
+adds the missing half of "matter tells space how to curve; space tells
+matter how to move". Each potential feature gets a deformation field
+``φ_k`` with momentum ``π_k``, one copy per sequence, and everything
+lives in one Hamiltonian:
+
+    V(q; φ) = Σ a_k log cosh(z_k) + Σ φ_k tanh²(z_k) + ½ Σ κ_i q_i²
+    H       = Σ p²/2m + V(q; φ) + Σ π²/2M + ½ Σ λ_k φ_k²
+
+* the trained landscape (``φ = 0``) is the **rest shape**: training
+  "jumpstarts the universe". ``λ`` is the stiffness of space and ``M`` its
+  inertia;
+* the force on the matter is ``−∂V/∂q``, which now includes the bend;
+* the force on the geometry is ``−∂H/∂φ_k = −tanh²(z_k) − λ_k φ_k``. It
+  depends on where the matter is, so the content bends the landscape.
+  Because ``tanh² ≥ 0``, matter pushes ``φ`` negative and lowers the
+  energy of the region it occupies: an attraction, like gravity. Nothing
+  about this coupling is hand-designed; it follows from putting both in
+  the same ``H``;
+* the bend enters through the *bounded* feature ``tanh²``. A first
+  version let ``φ`` scale the unbounded ``log cosh`` directly. Its joint
+  energy had no lower bound (a deeper well pulls matter further in,
+  which deepens the well): gravitational collapse, seen in tests as
+  energy reaching 1e34. With ``tanh²`` the joint energy is bounded below
+  by ``−Σ 1/(2λ_k)`` plus the static part;
+* ``H`` is separable (kinetic depends on momenta only), so the joint
+  leapfrog is exactly symplectic and, without friction, conserves the
+  joint energy;
+* the geometry has its own friction ``γ_Φ`` (learned or fixed alongside
+  the matter friction), which sets how long a bend persists.
+
+Every sequence starts flat, ``φ = π = 0`` (``init_hidden``): the bending is
+in-context memory only. Persisting it across sessions is future work
+(see ``docs/LESSONS.md``).
 """
 from __future__ import annotations
 
@@ -67,6 +105,9 @@ class HamiltonianCharModel(nn.Module):
         dt: float = 0.5,
         dissipation: str | float = "learned",
         gamma_init: float = 0.05,
+        geometry: str = "static",
+        stiffness_init: float = 1.0,
+        geometry_mass_init: float = 1.0,
     ):
         super().__init__()
         if n_layers < 1:
@@ -103,6 +144,18 @@ class HamiltonianCharModel(nn.Module):
             self._fixed_gamma = value
         self.dissipation = dissipation
 
+        if geometry not in ("static", "dynamic"):
+            raise ValueError("geometry must be 'static' or 'dynamic'")
+        self.geometry = geometry
+        self.n_potential = k
+        if geometry == "dynamic":
+            self._stiffness = nn.Parameter(torch.full((k,), _inv_softplus(stiffness_init)))
+            self._geom_mass = nn.Parameter(torch.full((k,), _inv_softplus(geometry_mass_init)))
+            if dissipation == "learned":
+                self._rho_geom = nn.Parameter(torch.full((k,), _inv_softplus(gamma_init)))
+            else:
+                self._rho_geom = None
+
         self.readout_norm = nn.LayerNorm(2 * hidden_dim)
         self.fc = nn.Linear(2 * hidden_dim, vocab_size)
 
@@ -124,25 +177,66 @@ class HamiltonianCharModel(nn.Module):
             (self.hidden_dim,), self._fixed_gamma, device=self.W.device, dtype=self.W.dtype
         )
 
-    def potential(self, q: torch.Tensor) -> torch.Tensor:
-        z = q @ self.W.t() + self.b
+    @property
+    def stiffness(self) -> torch.Tensor:
+        return F.softplus(self._stiffness)
+
+    @property
+    def geometry_mass(self) -> torch.Tensor:
+        return F.softplus(self._geom_mass) + 1e-3
+
+    @property
+    def gamma_geometry(self) -> torch.Tensor:
+        if self._rho_geom is not None:
+            return F.softplus(self._rho_geom)
+        return torch.full(
+            (self.n_potential,), self._fixed_gamma, device=self.W.device, dtype=self.W.dtype
+        )
+
+    @staticmethod
+    def _logcosh(z: torch.Tensor) -> torch.Tensor:
         # log cosh(z) = z + softplus(-2z) - log 2, numerically stable
-        logcosh = z + F.softplus(-2.0 * z) - math.log(2.0)
-        return (logcosh * self.a).sum(-1) + 0.5 * (self.kappa * q * q).sum(-1)
+        return z + F.softplus(-2.0 * z) - math.log(2.0)
 
-    def grad_potential(self, q: torch.Tensor) -> torch.Tensor:
+    def potential(self, q: torch.Tensor, phi: torch.Tensor | None = None) -> torch.Tensor:
+        """``V(q; φ)``; ``phi=None`` is the trained (flat, unbent) landscape."""
         z = q @ self.W.t() + self.b
-        return (torch.tanh(z) * self.a) @ self.W + self.kappa * q
+        V = (self._logcosh(z) * self.a).sum(-1) + 0.5 * (self.kappa * q * q).sum(-1)
+        if phi is not None:
+            V = V + (torch.tanh(z).pow(2) * phi).sum(-1)
+        return V
 
-    def energy(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        """Total energy ``H(q, p)`` per batch element."""
-        return 0.5 * (p * p / self.mass).sum(-1) + self.potential(q)
+    def grad_potential(self, q: torch.Tensor, phi: torch.Tensor | None = None) -> torch.Tensor:
+        z = q @ self.W.t() + self.b
+        t = torch.tanh(z)
+        coeff = t * self.a
+        if phi is not None:
+            coeff = coeff + 2.0 * t * (1.0 - t * t) * phi
+        return coeff @ self.W + self.kappa * q
+
+    def geometry_force(self, q: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+        """``−∂H/∂φ``: matter lowers the energy where it is; stiffness flattens."""
+        z = q @ self.W.t() + self.b
+        return -torch.tanh(z).pow(2) - self.stiffness * phi
+
+    def energy(self, q, p, phi=None, pi=None) -> torch.Tensor:
+        """Total energy per batch element (joint matter + geometry when given)."""
+        H = 0.5 * (p * p / self.mass).sum(-1) + self.potential(q, phi)
+        if phi is not None:
+            H = H + 0.5 * (pi * pi / self.geometry_mass).sum(-1)
+            H = H + 0.5 * (self.stiffness * phi * phi).sum(-1)
+        return H
 
     # ---- dynamics -------------------------------------------------------
 
-    def flow(self, q, p, n_steps: int, dt: float | None = None):
-        """Advance ``(q, p)`` by ``n_steps`` damped-leapfrog steps (no input)."""
+    def flow(self, q, p, n_steps: int, dt: float | None = None, phi=None, pi=None):
+        """Advance the state by ``n_steps`` damped-leapfrog steps (no input).
+
+        Returns ``(q, p)``, or ``(q, p, phi, pi)`` when a geometry state is given.
+        """
         dt = self.dt if dt is None else dt
+        if phi is not None:
+            return self._flow_joint(q, p, phi, pi, n_steps, dt)
         m = self.mass
         gamma = self.gamma
         decay = torch.exp(-gamma * (abs(dt) * 0.5)) if bool((gamma > 0).any()) else None
@@ -156,23 +250,57 @@ class HamiltonianCharModel(nn.Module):
                 p = p * decay
         return q, p
 
+    def _flow_joint(self, q, p, phi, pi, n_steps: int, dt: float):
+        m, M = self.mass, self.geometry_mass
+        g, g_phi = self.gamma, self.gamma_geometry
+        damp = bool((g > 0).any()) or bool((g_phi > 0).any())
+        if damp:
+            decay = torch.exp(-g * (abs(dt) * 0.5))
+            decay_phi = torch.exp(-g_phi * (abs(dt) * 0.5))
+        h = 0.5 * dt
+        for _ in range(n_steps):
+            if damp:
+                p, pi = p * decay, pi * decay_phi
+            p = p - h * self.grad_potential(q, phi)
+            pi = pi + h * self.geometry_force(q, phi)
+            q = q + dt * p / m
+            phi = phi + dt * pi / M
+            p = p - h * self.grad_potential(q, phi)
+            pi = pi + h * self.geometry_force(q, phi)
+            if damp:
+                p, pi = p * decay, pi * decay_phi
+        return q, p, phi, pi
+
     def forward(self, embedded: torch.Tensor, hidden=None):
         """``embedded``: (B, T, embedding_dim) → logits (B, T, vocab), (q, p)."""
         batch, seq_len, _ = embedded.shape
         if hidden is None:
             hidden = self.init_hidden(batch)
-        q, p = hidden
+        dynamic = self.geometry == "dynamic"
+        if dynamic:
+            q, p, phi, pi = hidden
+        else:
+            q, p = hidden
         kicks = self.impulse(embedded)  # (B, T, h)
         outputs = []
         for t in range(seq_len):
             p = p + kicks[:, t]
-            q, p = self.flow(q, p, self.n_substeps)
+            if dynamic:
+                q, p, phi, pi = self._flow_joint(q, p, phi, pi, self.n_substeps, self.dt)
+            else:
+                q, p = self.flow(q, p, self.n_substeps)
+            # The readout sees only the matter: the geometry acts on the
+            # prediction solely by changing how the matter moves.
             outputs.append(torch.cat([q, p / self.mass], dim=-1))
         states = torch.stack(outputs, dim=1)
         logits = self.fc(self.readout_norm(states))
-        return logits, (q, p)
+        return logits, ((q, p, phi, pi) if dynamic else (q, p))
 
     def init_hidden(self, batch_size: int):
         ref = self.W
         zeros = ref.new_zeros(batch_size, self.hidden_dim)
+        if self.geometry == "dynamic":
+            # Every sequence starts from the trained, unbent landscape.
+            flat = ref.new_zeros(batch_size, self.n_potential)
+            return (zeros, zeros.clone(), flat, flat.clone())
         return (zeros, zeros.clone())

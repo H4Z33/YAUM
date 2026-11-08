@@ -6,6 +6,9 @@ learned energy as tokens arrive):
 
     ham_conservative   friction γ = 0: a purely Hamiltonian model
     ham_learned        per-mode friction γ_i learned with the weights
+    ham_geometry       ham_learned + dynamic geometry: the landscape is
+                       bent by the content as it is read (joint
+                       matter/geometry Hamiltonian; resets every sequence)
 
 All models use an ordinary ``nn.Embedding`` and plain Adam — this
 experiment is about the dynamics *inside* the forward pass, not the
@@ -22,12 +25,24 @@ Tasks (sequence length ``T``, fresh random batches every step):
     lag            predict the token seen 5 steps ago, at every position.
                    Needs memory that is *short* — old tokens must be
                    forgotten or they interfere.
+    assoc          K (key, value) pairs with random bindings, then a query
+                   key; predict its value. The bindings change every
+                   sequence, so they cannot be stored in trained weights:
+                   the rules must be written *while reading*.
+                   Length 2K+1 (ignores --seq-len).
 
 Pre-registered hypothesis (written before the first run): the learned
 friction stays near zero on ``recall_first`` and ``count`` and grows on
 ``lag``; the conservative model does well on the first two and worst on
 ``lag``. If the learned γ does not separate the tasks, the "conservative
 core + controlled dissipation" story is not supported by this setup.
+
+Second pre-registered hypothesis (written 2026-11-08, before ``assoc``
+or ``ham_geometry`` had ever been run): ``ham_geometry`` beats
+``ham_learned`` on ``assoc`` by a margin larger than seed noise, and
+ties it (within noise) on ``recall_first``, ``count`` and ``lag``. If
+the dynamic geometry does not help on ``assoc``, "content must bend the
+landscape" is not supported by this implementation.
 
 Run:
 
@@ -91,7 +106,30 @@ def task_lag(batch, T, gen, lag=5):
     return x, y, mask
 
 
-TASKS = {"recall_first": task_recall_first, "count": task_count, "lag": task_lag}
+def task_assoc(batch, T, gen, pairs=4):
+    """Keys are tokens 0..7, values tokens 8..15; targets are value ids 0..7."""
+    del T  # length is fixed by the number of pairs
+    keys = torch.argsort(torch.rand(batch, N_SYMBOLS, generator=gen), dim=1)[:, :pairs]
+    values = torch.randint(0, N_SYMBOLS, (batch, pairs), generator=gen)
+    which = torch.randint(0, pairs, (batch,), generator=gen)
+    rows = torch.arange(batch)
+    x = torch.empty(batch, 2 * pairs + 1, dtype=torch.long)
+    x[:, 0:-1:2] = keys
+    x[:, 1:-1:2] = values + N_SYMBOLS
+    x[:, -1] = keys[rows, which]
+    y = torch.zeros_like(x)
+    y[:, -1] = values[rows, which]
+    mask = torch.zeros_like(x, dtype=torch.bool)
+    mask[:, -1] = True
+    return x, y, mask
+
+
+TASKS = {
+    "recall_first": task_recall_first,
+    "count": task_count,
+    "lag": task_lag,
+    "assoc": task_assoc,
+}
 VOCAB_IN = 2 * N_SYMBOLS
 
 
@@ -110,18 +148,38 @@ class Wrapped(nn.Module):
         return logits
 
 
+def set_forget_bias(lstm: nn.LSTM, value: float | None) -> None:
+    """Set the LSTM forget-gate bias (Gers et al. 2000; Jozefowicz et al. 2015).
+
+    PyTorch's default init gives a forget gate ≈ 0.5, so information decays
+    like 0.5^T. Over 40 steps that erases the first token (≈1e-12), which made
+    the LSTM sit at chance on ``recall_first`` in the first runs. ``1.0`` is
+    the standard fair-baseline setting; ``None`` keeps PyTorch's init.
+    """
+    if value is None:
+        return
+    h = lstm.hidden_size
+    with torch.no_grad():
+        for layer in range(lstm.num_layers):
+            # Gate order in PyTorch: input, forget, cell, output.
+            getattr(lstm, f"bias_ih_l{layer}")[h:2 * h].fill_(value)
+            getattr(lstm, f"bias_hh_l{layer}")[h:2 * h].zero_()
+
+
 def build(name: str, args) -> Wrapped:
     if name == "lstm":
         core = RNNCharModel(N_SYMBOLS, args.embedding_dim, args.hidden_dim, 1)
+        set_forget_bias(core.lstm, args.lstm_forget_bias)
     elif name == "ham_conservative":
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none",
         )
-    elif name == "ham_learned":
+    elif name in ("ham_learned", "ham_geometry"):
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="learned", gamma_init=args.gamma_init,
+            geometry="dynamic" if name == "ham_geometry" else "static",
         )
     else:
         raise ValueError(name)
@@ -140,6 +198,8 @@ class Result:
     wall_s: float
     gamma_median: float = float("nan")
     gamma_q90: float = float("nan")
+    geom_gamma_median: float = float("nan")
+    stiffness_median: float = float("nan")
 
 
 def masked_loss_acc(logits, y, mask):
@@ -182,9 +242,13 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
     )
     core = model.core
     if isinstance(core, HamiltonianCharModel) and core.dissipation == "learned":
+        # Matter friction only; geometry friction is reported separately.
         g = core.gamma.detach()
         result.gamma_median = float(g.median())
         result.gamma_q90 = float(torch.quantile(g, 0.9))
+    if isinstance(core, HamiltonianCharModel) and core.geometry == "dynamic":
+        result.geom_gamma_median = float(core.gamma_geometry.detach().median())
+        result.stiffness_median = float(core.stiffness.detach().median())
     return result
 
 
@@ -199,10 +263,12 @@ def report(results: list[Result], args) -> str:
     lines = [
         (
             f"\n## Run steps={args.steps} T={args.seq_len} hidden={args.hidden_dim} "
-            f"substeps={args.substeps} dt={args.dt} seeds={list(args.seeds)}\n"
+            f"substeps={args.substeps} dt={args.dt} seeds={list(args.seeds)} "
+            f"lstm_forget_bias={args.lstm_forget_bias}\n"
         ),
-        "| task | model | accuracy | params | learned γ median (90th pct) | wall (s) |",
-        "|---|---|---:|---:|---:|---:|",
+        ("| task | model | accuracy | params | learned γ median (90th pct) "
+        "| geometry γ / stiffness λ | wall (s) |"),
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for task in TASKS:
         for model in MODELS:
@@ -213,20 +279,27 @@ def report(results: list[Result], args) -> str:
             gm, _ = _ms([r.gamma_median for r in rs])
             gq, _ = _ms([r.gamma_q90 for r in rs])
             gamma = f"{gm:.3f} ({gq:.3f})" if math.isfinite(gm) else "—"
+            geo_g, _ = _ms([r.geom_gamma_median for r in rs])
+            stiff, _ = _ms([r.stiffness_median for r in rs])
+            geo = f"{geo_g:.3f} / {stiff:.3f}" if math.isfinite(geo_g) else "—"
             lines.append(
                 f"| {task} | `{model}` | {acc_m:.3f} ± {acc_s:.3f} | {rs[0].params:,} "
-                f"| {gamma} | {_ms([r.wall_s for r in rs])[0]:.0f} |"
+                f"| {gamma} | {geo} | {_ms([r.wall_s for r in rs])[0]:.0f} |"
             )
     lines.append("")
     lines.append(
-        "Chance accuracy: recall_first 0.125, lag 0.125, count ≈ 0.2. "
+        "Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. "
         f"Learned γ starts at {args.gamma_init}."
     )
     lines.append("")
     return "\n".join(lines)
 
 
-MODELS = ("lstm", "ham_conservative", "ham_learned")
+def _float_or_none(text: str):
+    return None if text.lower() == "none" else float(text)
+
+
+MODELS = ("lstm", "ham_conservative", "ham_learned", "ham_geometry")
 
 
 def main() -> None:
@@ -241,8 +314,14 @@ def main() -> None:
     parser.add_argument("--dt", type=float, default=0.5)
     parser.add_argument("--gamma-init", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument(
+        "--lstm-forget-bias", type=_float_or_none, default=1.0,
+        help="LSTM forget-gate bias init (runs before 2026-11-08 evening used "
+             "PyTorch's default, equivalent to --lstm-forget-bias none).",
+    )
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
-    parser.add_argument("--tasks", nargs="+", default=list(TASKS))
+    parser.add_argument("--tasks", nargs="+", default=list(TASKS), choices=list(TASKS))
+    parser.add_argument("--models", nargs="+", default=list(MODELS), choices=list(MODELS))
     parser.add_argument(
         "--output",
         default=os.path.join(os.path.dirname(__file__), "context_dynamics_results.md"),
@@ -252,7 +331,7 @@ def main() -> None:
 
     results = []
     for task in args.tasks:
-        for model in MODELS:
+        for model in args.models:
             for seed in args.seeds:
                 r = run(task, model, seed, args)
                 print(
