@@ -18,6 +18,13 @@ scientific soundness) found the problems below; all are fixed in commits
 
 ### Lessons
 
+0. **The first result that bears on the real thesis came from moving the
+   physics into context time.** On synthetic tasks, a Hamiltonian hidden
+   state with learned friction matched or beat an LSTM, and the friction
+   it learned ordered the tasks by how much forgetting they need. One
+   registered prediction (count wants γ ≈ 0) was wrong. Keep registering
+   predictions; the wrong one taught the most.
+
 1. **A diagnostic can be precise and still measure the wrong thing.**
    `|ΔH/H|` was computed against the first eval's `H`. Since `H ≈ loss`,
    the "energy drift" of 0.83 was just `(L₀ − L)/L₀`. The docs read it as
@@ -100,11 +107,16 @@ hash instead of deleting them.
 
 ### Research (context time — the main line)
 
-- [ ] **Read the first `context_dynamics` results** (LSTM vs conservative
-      vs learned-friction Hamiltonian on `recall_first` / `count` / `lag`)
-      and write them into `docs/ARTICLE.md` §4. The hypothesis was
-      registered before the run: learned γ ≈ 0 on recall/count, larger on
-      lag.
+- [x] Read the first `context_dynamics` results and write them into
+      `docs/ARTICLE.md` §4. Learned γ: recall 0.036 < count 0.15 < lag 0.24.
+      Hypothesis supported on recall and lag, **wrong on count**: discrete
+      bounded state seems to need attractors, so it needs dissipation.
+- [ ] **Tune the LSTM** (lr sweep, more steps) on `recall_first` before
+      claiming any long-memory advantage. It stayed at chance untuned.
+- [ ] Test the "discrete state needs attractors" reading of `count`, e.g.
+      unbounded counting (no clipping) should want less γ than bounded.
+- [ ] Per-mode analysis: with learned γ, do some modes go to ~0 (memory)
+      while others go high (scratch)? Plot the γ distribution per task.
 - [ ] Parameter-matched comparison (the LSTM has ~2× the parameters of the
       Hamiltonian model at the same `hidden_dim`).
 - [ ] Longer sequences (T = 100, 200) where LSTMs are known to struggle;

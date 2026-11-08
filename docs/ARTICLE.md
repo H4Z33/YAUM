@@ -182,7 +182,54 @@ ordinary `nn.Embedding` on three synthetic tasks:
 near zero on `recall_first` and `count` and grows on `lag`; the
 conservative model does well on the first two and worst on `lag`.
 
-*Results: see `benchmarks/context_dynamics_results.md` (this section is updated once the first full run completes).*
+### Results (1500 steps, T = 40, hidden 64, 2 seeds)
+
+| task | LSTM | Hamiltonian, γ = 0 | Hamiltonian, learned γ | learned γ median (90th pct) |
+|---|---:|---:|---:|---:|
+| `recall_first` | 0.116 ± 0.003 | **1.000** | **1.000** | 0.036 (0.043) |
+| `count` | **1.000** | 0.719 ± 0.056 | **1.000** | 0.150 (0.302) |
+| `lag` | **1.000** | 0.928 ± 0.003 | 0.995 ± 0.001 | 0.240 (0.363) |
+
+Accuracy on 1024 fresh sequences. Chance is 0.125 for `recall_first` and
+`lag`. The LSTM has 21.8k parameters, the Hamiltonian models 11.2k. Learned
+γ starts at 0.05. Raw output is in `benchmarks/context_dynamics_results.md`.
+
+**What happened compared with the registered hypothesis:**
+
+1. **The friction separates the tasks.** Learned γ ends up ordered
+   `recall_first` (0.036, *below* its 0.05 start) < `count` (0.15) <
+   `lag` (0.24), and is consistent across seeds. When the model can
+   choose, it chooses almost no dissipation for lossless memory and the
+   most dissipation for the task that needs forgetting. **Supported.**
+2. **`count` went against the prediction.** It was expected to want
+   γ ≈ 0, since accumulation is what momentum does naturally. Instead the
+   conservative model scored worst there (0.72) and the learned model
+   raised γ to 0.15 to reach 1.00. A plausible reading: the depth is a
+   *discrete*, bounded state, and holding a discrete state robustly needs
+   attractors (wells you settle into), which only dissipation provides.
+   Pure accumulation drifts. **Hypothesis wrong on this task.**
+3. **`lag`**: conservative is worst-but-close (0.93), learned γ is
+   highest, as predicted. **Supported.**
+4. **Long memory:** on `recall_first` both Hamiltonian models are perfect
+   while the LSTM stays at chance. **Caveat:** an LSTM can solve 40-step
+   recall with more steps or a tuned learning rate; it was *not* tuned
+   here (lr 3e-3, 1500 steps for every model). This shows the
+   Hamiltonian state learns long recall *quickly and robustly*. It does
+   not show that LSTMs can't.
+
+**Caveats that bound these claims:** synthetic tasks, short sequences,
+2 seeds, an untuned LSTM, unmatched parameter counts, and a Hamiltonian
+model about 10× slower per step (a Python loop over tokens). The next
+experiments are listed in `docs/LESSONS.md`.
+
+**What it means for the thesis:** this is the first result in the project
+that bears on the actual idea. A model whose state obeys mechanical
+rules learns a usable memory, and the one degree of freedom left
+open — how much energy to dissipate — gets set differently by each task,
+in a direction that mostly matches the physics intuition. "Conservative
+core plus controlled dissipation" looks like the right framing; "purely
+Hamiltonian" does not: the γ = 0 model is the worst Hamiltonian variant
+on two of the three tasks.
 
 ---
 
