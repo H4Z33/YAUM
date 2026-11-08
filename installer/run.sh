@@ -19,8 +19,14 @@ if ! command -v uv >/dev/null 2>&1; then
     fi
 fi
 
-echo "[yaum] uv $(uv --version) — resolving environment..."
+if command -v nvidia-smi >/dev/null 2>&1; then
+    REQUIREMENTS="requirements.txt"
+else
+    REQUIREMENTS="requirements-cpu.txt"
+fi
+
+echo "[yaum] uv $(uv --version) — resolving environment from ${REQUIREMENTS}..."
 exec uv run \
     --python ">=3.10" \
-    --with-requirements requirements.txt \
+    --with-requirements "$REQUIREMENTS" \
     python -m yaum.ui.app "$@"

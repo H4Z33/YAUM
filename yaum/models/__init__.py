@@ -25,12 +25,12 @@ def make_model(vocab_size: int, config: dict):
             f"Unknown model_type {model_type!r}. Available: {sorted(MODELS)}"
         ) from err
 
-    kwargs = dict(
-        vocab_size=vocab_size,
-        embedding_dim=config["embedding_dim"],
-        hidden_dim=config["hidden_dim"],
-        n_layers=config["n_layers"],
-    )
+    kwargs = {
+        "vocab_size": vocab_size,
+        "embedding_dim": config["embedding_dim"],
+        "hidden_dim": config["hidden_dim"],
+        "n_layers": config["n_layers"],
+    }
     if model_type == "transformer":
         if "n_heads" in config:
             kwargs["n_heads"] = int(config["n_heads"])

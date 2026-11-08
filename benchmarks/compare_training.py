@@ -1,337 +1,103 @@
-"""Head-to-head comparison: Adam-on-embeddings vs YAUM symplectic E.
+"""Head-to-head comparison of embedding update rules.
 
 Everything except how the embedding matrix ``E`` is updated is held
-fixed between runs:
+fixed: the synthetic corpus, the model (``RNNCharModel``), the weight
+optimiser (Adam on ``W``), the number of steps, and the held-out test
+set (every non-overlapping window of the test split, identical for all
+variants). Each variant runs over several seeds; we report mean ± std.
 
-    * identical synthetic corpus (deterministic seed),
-    * identical model (RNNCharModel) and weight-optimiser (Adam on W),
-    * identical batches in identical order,
-    * identical number of gradient steps.
+Variants:
 
-Only the E-update rule changes:
+    frozen_E          E stays at its random initialisation (control:
+                      how much of the learning is just W?)
+    adam_E            E is an ordinary parameter, Adam lr=1e-3 (same lr as W)
+    adam_E_tuned      Adam on E with lr=1e-2, the best of a sweep over
+                      {1e-3, 3e-3, 1e-2, 3e-2, 1e-1} on this setup. Any
+                      claim that YAUM "beats Adam" must be made against
+                      this row, not the untuned one.
+    yaum_static       leapfrog, uniform mass 1, no friction
+                      (the original YAUM configuration)
+    yaum_fisher       leapfrog, RMS-Fisher mass, no friction
+    yaum_damped       trainer defaults: RMS-Fisher mass, leapfrog core
+                      wrapped in friction (Langevin at T=0), adaptive dt
 
-    baseline_adam   E is a torch Parameter, Adam lr=1e-3
-    yaum_leapfrog   E evolves via leapfrog with dt from config
-    yaum_yoshida4   E evolves via Yoshida 4th-order with dt from config
-
-For each configuration we record wall time, final train/test loss, best
-test loss, and the peak energy drift |ΔH/H| observed during training.
-Results print as a markdown table and get appended to
-``benchmarks/results.md``.
+``max |dH/H|`` is the worst *one-step* relative energy error of the
+conservative core (same batch, same weights, before vs after the step).
+It is a property of the integrator. Earlier versions of this benchmark
+reported drift against the first step, which mostly measured how much
+the loss had fallen.
 
 Run:
 
-    uv run --with-requirements requirements.txt python -m benchmarks.compare_training
-    uv run ... python -m benchmarks.compare_training --num-steps 400 --seed 1
+    python -m benchmarks.compare_training
+    python -m benchmarks.compare_training --num-steps 1000 --seeds 0 1 2 3
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import math
 import os
+import statistics
+import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from yaum.core.dynamics import make_force_fn, total_hamiltonian
-from yaum.core.integrators import make_integrator
+from yaum.core.trainer import Trainer
 from yaum.core.utils import get_batch
 from yaum.models.rnn import RNNCharModel
 
+VOCAB = 32
 
-# --------------------------------------------------------------------------
-# Synthetic corpus: predictable but non-trivial (period-11 cycle with a
-# small stutter). Big enough to have plenty of distinct context windows.
-# --------------------------------------------------------------------------
 
 def _make_corpus(n_tokens: int = 4096, vocab_size: int = 16) -> torch.Tensor:
+    """Period-11 cycle with a stutter: predictable but non-trivial."""
     base = [(i * 7 + (i // 11)) % vocab_size for i in range(n_tokens)]
     return torch.tensor(base, dtype=torch.long)
 
 
 def _split(data: torch.Tensor, test_frac: float = 0.1):
-    n = len(data)
-    cut = int(n * (1.0 - test_frac))
+    cut = int(len(data) * (1.0 - test_frac))
     return data[:cut], data[cut:]
 
 
-# --------------------------------------------------------------------------
-# Shared pieces
-# --------------------------------------------------------------------------
+def _fixed_test_windows(test_data: torch.Tensor, context_window: int):
+    """All non-overlapping (x, y) windows of the test split."""
+    n = (len(test_data) - 1) // context_window
+    idx = torch.arange(n).unsqueeze(1) * context_window + torch.arange(context_window)
+    return test_data[idx], test_data[idx + 1]
+
+
+@torch.no_grad()
+def held_out_loss(model, E, windows) -> float:
+    x, y = windows
+    was_training = model.training
+    model.eval()
+    logits, _ = model(F.embedding(x, E.detach()), model.init_hidden(x.shape[0]))
+    loss = F.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
+    if was_training:
+        model.train()
+    return float(loss)
+
 
 @dataclass
 class RunResult:
     name: str
+    seed: int
     wall_s: float
-    final_train_loss: float
-    final_test_loss: float
-    best_test_loss: float
-    peak_drift: float = float("nan")
-    force_evals: int = 0
-    extra: dict = field(default_factory=dict)
+    test_loss: float
+    max_step_drift: float = float("nan")
+    E_moved: float = float("nan")  # ||E - E0|| / ||E0||
 
 
-def _eval_loss(model, E, test_data, context_window, batch_size, vocab_size, n_batches=8):
-    was_training = model.training
-    model.eval()
-    total = 0.0
-    count = 0
-    with torch.no_grad():
-        for _ in range(n_batches):
-            try:
-                x, y = get_batch(test_data, context_window, batch_size, "cpu")
-            except ValueError:
-                break
-            emb = F.embedding(x, E.detach())
-            hidden = model.init_hidden(batch_size)
-            logits, _ = model(emb, hidden)
-            loss = F.cross_entropy(
-                logits.reshape(-1, vocab_size), y.reshape(-1)
-            )
-            if torch.isfinite(loss):
-                total += loss.item()
-                count += 1
-    if was_training:
-        model.train()
-    return total / count if count else float("nan")
-
-
-def _build_model(vocab_size, cfg) -> RNNCharModel:
-    return RNNCharModel(
-        vocab_size=vocab_size,
-        embedding_dim=cfg["embedding_dim"],
-        hidden_dim=cfg["hidden_dim"],
-        n_layers=cfg["n_layers"],
-    )
-
-
-def _seed(seed: int):
-    torch.manual_seed(seed)
-
-
-def _fresh_state(vocab_size, cfg, seed):
-    _seed(seed)
-    model = _build_model(vocab_size, cfg)
-    E = torch.randn(vocab_size, cfg["embedding_dim"])
-    P = torch.zeros_like(E)
-    mass = torch.ones(vocab_size, 1)
-    return model, E, P, mass
-
-
-# --------------------------------------------------------------------------
-# Variant A: Adam on embeddings
-# --------------------------------------------------------------------------
-
-def run_baseline_adam(train_data, test_data, vocab_size, cfg, seed) -> RunResult:
-    model, E, _P, _mass = _fresh_state(vocab_size, cfg, seed)
-    E = E.detach().clone().requires_grad_(True)
-
-    opt_w = optim.Adam(model.parameters(), lr=cfg["learning_rate_W"])
-    opt_e = optim.Adam([E], lr=cfg["embedding_lr"])
-    criterion = torch.nn.CrossEntropyLoss()
-
-    _seed(seed + 101)  # deterministic batch sequence (shared by all variants)
-    model.train()
-    best_test = math.inf
-    final_train = math.nan
-    t0 = time.perf_counter()
-    for _ in range(cfg["num_steps"]):
-        x, y = get_batch(train_data, cfg["context_window"], cfg["batch_size"], "cpu")
-        emb = F.embedding(x, E)
-        hidden = model.init_hidden(cfg["batch_size"])
-        logits, _ = model(emb, hidden)
-        loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
-
-        opt_w.zero_grad(set_to_none=True)
-        opt_e.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["gradient_clip_norm_W"])
-        opt_w.step()
-        opt_e.step()
-        final_train = loss.item()
-
-        test_loss = _eval_loss(
-            model, E, test_data, cfg["context_window"], cfg["batch_size"], vocab_size
-        )
-        if math.isfinite(test_loss):
-            best_test = min(best_test, test_loss)
-    wall = time.perf_counter() - t0
-
-    final_test = _eval_loss(
-        model, E, test_data, cfg["context_window"], cfg["batch_size"], vocab_size
-    )
-    return RunResult(
-        name="baseline_adam",
-        wall_s=wall,
-        final_train_loss=final_train,
-        final_test_loss=final_test,
-        best_test_loss=best_test,
-        force_evals=cfg["num_steps"],  # one gradient per step
-    )
-
-
-# --------------------------------------------------------------------------
-# Variant B: YAUM symplectic integrator
-# --------------------------------------------------------------------------
-
-def run_yaum(train_data, test_data, vocab_size, cfg, seed, integrator_name) -> RunResult:
-    model, E, P, mass = _fresh_state(vocab_size, cfg, seed)
-    E = E.detach().clone().requires_grad_(True)
-    opt_w = optim.Adam(model.parameters(), lr=cfg["learning_rate_W"])
-    integrator = make_integrator(integrator_name)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    _seed(seed + 101)  # same batches as the baseline
-    model.train()
-    best_test = math.inf
-    final_train = math.nan
-    energy_ref = None
-    peak_drift = 0.0
-    total_force_evals = 0
-    t0 = time.perf_counter()
-    for _ in range(cfg["num_steps"]):
-        x, y = get_batch(train_data, cfg["context_window"], cfg["batch_size"], "cpu")
-        force_fn = make_force_fn(x, y, model, criterion)
-        step = integrator.step(
-            E, P, cfg["dt"], force_fn, mass, retain_final=True
-        )
-        total_force_evals += step.n_force_evals
-        E = step.E.requires_grad_(True)
-        P = step.P
-
-        opt_w.zero_grad(set_to_none=True)
-        step.loss_final.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["gradient_clip_norm_W"])
-        opt_w.step()
-
-        final_train = step.loss_final.item()
-        energy = total_hamiltonian(P, mass, step.loss_final)
-        if energy_ref is None:
-            energy_ref = energy
-        drift = abs(energy.drift(energy_ref))
-        if math.isfinite(drift):
-            peak_drift = max(peak_drift, drift)
-
-        test_loss = _eval_loss(
-            model, E, test_data, cfg["context_window"], cfg["batch_size"], vocab_size
-        )
-        if math.isfinite(test_loss):
-            best_test = min(best_test, test_loss)
-    wall = time.perf_counter() - t0
-
-    final_test = _eval_loss(
-        model, E, test_data, cfg["context_window"], cfg["batch_size"], vocab_size
-    )
-    return RunResult(
-        name=f"yaum_{integrator_name}",
-        wall_s=wall,
-        final_train_loss=final_train,
-        final_test_loss=final_test,
-        best_test_loss=best_test,
-        peak_drift=peak_drift,
-        force_evals=total_force_evals,
-    )
-
-
-# --------------------------------------------------------------------------
-# Driver
-# --------------------------------------------------------------------------
-
-def _format_results(results: list[RunResult]) -> str:
-    header = (
-        "| variant | wall (s) | force evals | final train | final test | "
-        "best test | peak |ΔH/H| |\n"
-        "|---|---:|---:|---:|---:|---:|---:|\n"
-    )
-    rows = []
-    for r in results:
-        drift = f"{r.peak_drift:.2e}" if math.isfinite(r.peak_drift) else "—"
-        rows.append(
-            f"| `{r.name}` | {r.wall_s:.2f} | {r.force_evals} "
-            f"| {r.final_train_loss:.4f} | {r.final_test_loss:.4f} "
-            f"| {r.best_test_loss:.4f} | {drift} |"
-        )
-    return header + "\n".join(rows) + "\n"
-
-
-def _conclusion(results: list[RunResult]) -> str:
-    by_name = {r.name: r for r in results}
-    baseline = by_name.get("baseline_adam")
-    leap = by_name.get("yaum_leapfrog")
-    yoshi = by_name.get("yaum_yoshida4")
-    lines = ["", "## Conclusions", ""]
-
-    def delta(a, b):
-        if not math.isfinite(a) or not math.isfinite(b):
-            return "—"
-        diff = a - b
-        pct = 100.0 * diff / b if b else float("inf")
-        arrow = "↓" if diff < 0 else ("↑" if diff > 0 else "=")
-        return f"{arrow} {abs(diff):.4f} ({pct:+.1f}%)"
-
-    if baseline and leap:
-        lines.append(
-            f"- **Best test loss — YAUM leapfrog vs Adam-on-E:** "
-            f"{delta(leap.best_test_loss, baseline.best_test_loss)}."
-        )
-    if baseline and yoshi:
-        lines.append(
-            f"- **Best test loss — YAUM yoshida4 vs Adam-on-E:** "
-            f"{delta(yoshi.best_test_loss, baseline.best_test_loss)}."
-        )
-    if leap:
-        lines.append(
-            f"- **Leapfrog gives a new diagnostic Adam cannot:** peak |ΔH/H| "
-            f"= {leap.peak_drift:.2e}. This is the single number that tells "
-            "you the integrator is losing (or gaining) energy against the "
-            "loss landscape — a failure mode invisible to a plain optimiser."
-        )
-    if baseline and leap:
-        overhead = leap.wall_s / baseline.wall_s if baseline.wall_s else float("inf")
-        lines.append(
-            f"- **Wall-time cost of symplectic E:** {overhead:.2f}× baseline "
-            f"({leap.force_evals} force evals vs {baseline.force_evals} for "
-            "Adam — leapfrog evaluates the gradient twice per step)."
-        )
-    if leap and yoshi:
-        if yoshi.wall_s and leap.wall_s:
-            ratio = yoshi.wall_s / leap.wall_s
-        else:
-            ratio = float("inf")
-        lines.append(
-            f"- **Yoshida4 vs leapfrog:** {ratio:.2f}× wall time for "
-            f"{yoshi.force_evals / max(leap.force_evals, 1):.1f}× the force "
-            "evaluations. On this dataset the trajectories agree to float32 "
-            "precision — the per-token embedding force is too mild for the "
-            "fourth-order correction to do visible work, so leapfrog is the "
-            "right default until forces get stiffer."
-        )
-    lines.append("")
-    return "\n".join(lines)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--num-steps", type=int, default=200)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--embedding-dim", type=int, default=16)
-    parser.add_argument("--hidden-dim", type=int, default=32)
-    parser.add_argument("--context-window", type=int, default=24)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--dt", type=float, default=0.05)
-    parser.add_argument("--lr-w", type=float, default=1e-3)
-    parser.add_argument("--lr-e", type=float, default=1e-3)
-    parser.add_argument(
-        "--output",
-        default=os.path.join(os.path.dirname(__file__), "results.md"),
-        help="Path to append the markdown report to.",
-    )
-    args = parser.parse_args()
-
-    cfg = {
+def _cfg(args) -> dict:
+    return {
+        "model_type": "rnn",
         "embedding_dim": args.embedding_dim,
         "hidden_dim": args.hidden_dim,
         "n_layers": 1,
@@ -339,31 +105,176 @@ def main() -> None:
         "batch_size": args.batch_size,
         "num_steps": args.num_steps,
         "learning_rate_W": args.lr_w,
-        "embedding_lr": args.lr_e,
         "gradient_clip_norm_W": 1.0,
-        "dt": args.dt,
     }
 
-    data = _make_corpus(n_tokens=8192, vocab_size=32)
-    train_data, test_data = _split(data, test_frac=0.1)
-    vocab_size = 32
 
-    print(f"Running {args.num_steps}-step benchmark on synthetic corpus "
-          f"(vocab={vocab_size}, seed={args.seed})...")
+def run_plain(name, train_data, windows, cfg, seed, lr_e) -> RunResult:
+    """frozen_E (lr_e=None) or adam_E."""
+    torch.manual_seed(seed)
+    model = RNNCharModel(VOCAB, cfg["embedding_dim"], cfg["hidden_dim"], cfg["n_layers"])
+    E0 = torch.randn(VOCAB, cfg["embedding_dim"])
+    E = E0.clone().requires_grad_(lr_e is not None)
+    opt_w = optim.Adam(model.parameters(), lr=cfg["learning_rate_W"])
+    opt_e = optim.Adam([E], lr=lr_e) if lr_e is not None else None
+    model.train()
+    t0 = time.perf_counter()
+    for _ in range(cfg["num_steps"]):
+        x, y = get_batch(train_data, cfg["context_window"], cfg["batch_size"], "cpu")
+        logits, _ = model(F.embedding(x, E), model.init_hidden(cfg["batch_size"]))
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB), y.reshape(-1))
+        opt_w.zero_grad(set_to_none=True)
+        if opt_e is not None:
+            opt_e.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["gradient_clip_norm_W"])
+        opt_w.step()
+        if opt_e is not None:
+            opt_e.step()
+    wall = time.perf_counter() - t0
+    return RunResult(
+        name=name,
+        seed=seed,
+        wall_s=wall,
+        test_loss=held_out_loss(model, E, windows),
+        E_moved=float((E.detach() - E0).norm() / E0.norm()),
+    )
 
-    results = [
-        run_baseline_adam(train_data, test_data, vocab_size, cfg, args.seed),
-        run_yaum(train_data, test_data, vocab_size, cfg, args.seed, "leapfrog"),
-        run_yaum(train_data, test_data, vocab_size, cfg, args.seed, "yoshida4"),
+
+def run_yaum(name, train_data, test_data, windows, cfg, seed, overrides) -> RunResult:
+    torch.manual_seed(seed)
+    config = dict(cfg)
+    config.update(
+        eval_interval=cfg["num_steps"],  # telemetry once at the end; we eval below
+        eval_iters=1,
+        results_dir=tempfile.mkdtemp(prefix="yaum_bench_"),
+        snapshot_interval=0,
+        snapshot_on_shift=False,
+        reversibility_check_interval=0,
+        safe_speed=False,
+        step_delay=0.0,
+    )
+    config.update(overrides)
+    trainer = Trainer(config)
+    with contextlib.redirect_stdout(io.StringIO()):
+        trainer.setup(train_data, test_data, {}, {}, VOCAB, torch.ones(VOCAB, 1))
+        E0 = trainer.E.detach().clone()
+        t0 = time.perf_counter()
+        for _ in trainer.train():
+            pass
+        wall = time.perf_counter() - t0
+    drift = trainer.get_history()["H_drift"]
+    return RunResult(
+        name=name,
+        seed=seed,
+        wall_s=wall,
+        test_loss=held_out_loss(trainer.model, trainer.E, windows),
+        max_step_drift=max(drift) if drift else float("nan"),
+        E_moved=float((trainer.E.detach() - E0).norm() / E0.norm()),
+    )
+
+
+YAUM_VARIANTS = {
+    "yaum_static": dict(
+        integrator="leapfrog", mass_mode="static", adaptive_dt=False, dt=0.05
+    ),
+    "yaum_fisher": dict(integrator="leapfrog", adaptive_dt=False, dt=0.01),
+    "yaum_damped": {},  # trainer defaults
+}
+
+
+def _mean_std(values):
+    values = [v for v in values if math.isfinite(v)]
+    if not values:
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return values[0], 0.0
+    return statistics.mean(values), statistics.stdev(values)
+
+
+def format_report(results: list[RunResult], args) -> str:
+    names = list(dict.fromkeys(r.name for r in results))
+    lines = [
+        f"\n## Run steps={args.num_steps} seeds={list(args.seeds)}\n",
+        "| variant | held-out loss | ‖E−E₀‖/‖E₀‖ | max one-step \\|ΔH/H\\| | wall (s) |",
+        "|---|---:|---:|---:|---:|",
     ]
+    summary = {}
+    for name in names:
+        rs = [r for r in results if r.name == name]
+        loss_m, loss_s = _mean_std([r.test_loss for r in rs])
+        moved_m, _ = _mean_std([r.E_moved for r in rs])
+        drift_m, _ = _mean_std([r.max_step_drift for r in rs])
+        wall_m, _ = _mean_std([r.wall_s for r in rs])
+        summary[name] = loss_m
+        drift = f"{drift_m:.1e}" if math.isfinite(drift_m) else "—"
+        lines.append(
+            f"| `{name}` | {loss_m:.4f} ± {loss_s:.4f} | {moved_m:.2f} | {drift} | {wall_m:.1f} |"
+        )
+    best = min(summary, key=summary.get)
+    lines.append("")
+    lines.append(f"Lowest held-out loss: `{best}`.")
+    if "frozen_E" in summary and "yaum_static" in summary:
+        lines.append(
+            f"`yaum_static` vs `frozen_E`: {summary['yaum_static'] - summary['frozen_E']:+.4f} "
+            "(negative = the dynamics on E help at all)."
+        )
+    stds = {
+        name: _mean_std([r.test_loss for r in results if r.name == name])[1]
+        for name in names
+    }
+    if "adam_E_tuned" in summary and "yaum_damped" in summary:
+        diff = summary["yaum_damped"] - summary["adam_E_tuned"]
+        noise = max(stds["yaum_damped"], stds["adam_E_tuned"])
+        verdict = (
+            "within seed noise — a tie" if abs(diff) <= noise
+            else ("YAUM better" if diff < 0 else "Adam better")
+        )
+        lines.append(
+            f"`yaum_damped` vs `adam_E_tuned`: {diff:+.4f} (seed std ≈ {noise:.4f}; {verdict})."
+        )
+    lines.append("")
+    return "\n".join(lines)
 
-    table = _format_results(results)
-    conclusion = _conclusion(results)
-    report = f"\n## Run seed={args.seed} steps={args.num_steps}\n\n{table}{conclusion}"
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--num-steps", type=int, default=600)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    parser.add_argument("--embedding-dim", type=int, default=16)
+    parser.add_argument("--hidden-dim", type=int, default=32)
+    parser.add_argument("--context-window", type=int, default=24)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr-w", type=float, default=1e-3)
+    parser.add_argument("--lr-e", type=float, default=1e-3)
+    parser.add_argument("--lr-e-tuned", type=float, default=1e-2)
+    parser.add_argument(
+        "--output",
+        default=os.path.join(os.path.dirname(__file__), "results.md"),
+        help="Markdown file to append the report to ('' to skip).",
+    )
+    args = parser.parse_args()
+
+    cfg = _cfg(args)
+    train_data, test_data = _split(_make_corpus(8192, VOCAB), test_frac=0.1)
+    windows = _fixed_test_windows(test_data, cfg["context_window"])
+
+    results: list[RunResult] = []
+    for seed in args.seeds:
+        print(f"seed {seed}...", flush=True)
+        results.append(run_plain("frozen_E", train_data, windows, cfg, seed, None))
+        results.append(run_plain("adam_E", train_data, windows, cfg, seed, args.lr_e))
+        results.append(
+            run_plain("adam_E_tuned", train_data, windows, cfg, seed, args.lr_e_tuned)
+        )
+        for name, overrides in YAUM_VARIANTS.items():
+            results.append(
+                run_yaum(name, train_data, test_data, windows, cfg, seed, overrides)
+            )
+
+    report = format_report(results, args)
     print(report)
-
     if args.output:
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         with open(args.output, "a", encoding="utf-8") as fh:
             fh.write(report)
         print(f"Appended report to {args.output}")

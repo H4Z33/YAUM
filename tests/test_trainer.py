@@ -1,12 +1,13 @@
 """Trainer integration spec.
 
 These run a tiny model end-to-end on synthetic data. They don't prove the
-physics â€” that's what test_integrators and test_dynamics do â€” but they
+physics — that's what test_integrators and test_dynamics do — but they
 verify the plumbing: setup, training yields, evaluation, checkpoint
 round-trip, generation, and integrator selection.
 """
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -102,7 +103,7 @@ def test_train_loop_commits_phase_state_on_non_eval_steps(tmp_path):
     def fake_step_embeddings(_x_batch, _y_batch):
         loss_l1 = torch.tensor(1.0, device=trainer.E.device)
         loss_l2 = torch.tensor(1.0, device=trainer.E.device, requires_grad=True)
-        return trainer.E.detach() + 1.0, trainer.P.detach() + 1.0, loss_l1, loss_l2
+        return trainer.E.detach() + 1.0, trainer.P.detach() + 1.0, loss_l1, loss_l2, None
 
     trainer._step_embeddings = fake_step_embeddings
     events = list(trainer.train())
@@ -283,11 +284,15 @@ def test_trainer_runs_with_langevin_thermostat(tmp_path):
 
 
 def test_adaptive_dt_on_by_default(tmp_path):
-    trainer = Trainer(_tiny_config(tmp_path))
+    config = _tiny_config(tmp_path)
+    config.pop("integrator")
+    trainer = Trainer(config)
     assert trainer.adaptive is not None
     assert trainer.config["mass_mode"] == "fisher"
-    assert trainer.config["dt_min"] == 0.00001
-    assert trainer.config["dt_max"] == 0.01
+    assert trainer.config["dt_min"] == 0.0001
+    assert trainer.config["dt_max"] == 0.1
+    assert trainer.integrator.name == "langevin"
+    assert trainer.integrator.kT == 0.0 and trainer.integrator.gamma > 0
     assert trainer.config["snapshot_on_shift"] is True
     assert trainer.config["snapshot_interval"] > 0
     assert trainer.config["reversibility_check_interval"] > 0
@@ -313,7 +318,7 @@ def test_reversibility_probe_records_residuals(tmp_path):
     recorded = history["reversibility"]
     assert len(recorded) == len(history["test_l"])
     # All eval ticks should have produced finite numbers, not NaN sentinels.
-    assert all(not (r != r) for r in recorded)
+    assert all(not math.isnan(r) for r in recorded)
 
 
 def test_reversibility_disabled_by_default_records_nan(tmp_path):
@@ -324,7 +329,7 @@ def test_reversibility_disabled_by_default_records_nan(tmp_path):
     recorded = trainer.get_history()["reversibility"]
     # Disabled => sentinel NaN on every eval tick.
     assert len(recorded) > 0
-    assert all(r != r for r in recorded)
+    assert all(math.isnan(r) for r in recorded)
 
 
 def test_action_telemetry_populates_history(tmp_path):
@@ -340,8 +345,8 @@ def test_action_telemetry_populates_history(tmp_path):
     assert len(history["lagrangian"]) == n
     # All entries must be finite real numbers; the running S is a cumulative
     # sum of L*dt, so at least one record should have landed.
-    assert all(v == v for v in history["action"])  # not NaN
-    assert all(v == v for v in history["lagrangian"])
+    assert all(not math.isnan(v) for v in history["action"])  # not NaN
+    assert all(not math.isnan(v) for v in history["lagrangian"])
     assert trainer._action.steps >= 1
 
 
@@ -359,8 +364,8 @@ def test_phase_transition_observables_populate_history(tmp_path):
         assert len(history[key]) == n
     # At least one eval tick should have produced a finite number once the
     # rolling window filled up.
-    assert any(v == v for v in history["specific_heat"])  # not all NaN
-    assert any(v == v for v in history["susceptibility"])
+    assert any(not math.isnan(v) for v in history["specific_heat"])  # not all NaN
+    assert any(not math.isnan(v) for v in history["susceptibility"])
 
 
 def test_trainer_runs_with_fisher_mass(tmp_path):
@@ -405,9 +410,10 @@ def test_adaptive_dt_controller_wires_in_and_records_dt(tmp_path):
     config = _tiny_config(tmp_path, num_steps=4)
     config.update(
         adaptive_dt=True,
+        dt=1.0,            # large step => measurable one-step energy error
         dt_min=1e-5,
         dt_max=1.0,
-        drift_high=1e-6,   # force shrinks
+        drift_high=1e-9,   # force shrinks
         drift_low=-1.0,    # never grow
         dt_shrink=0.5,
         dt_grow=2.0,
@@ -423,3 +429,88 @@ def test_adaptive_dt_controller_wires_in_and_records_dt(tmp_path):
     history = trainer.get_history()
     assert "dt" in history
     assert len(history["dt"]) == len(history["test_l"])
+
+
+# ---- regressions from the audit ------------------------------------------
+
+def _learning_config(tmp_path, **over):
+    config = {
+        "embedding_dim": 8,
+        "hidden_dim": 16,
+        "n_layers": 1,
+        "learning_rate_W": 3e-3,
+        "gradient_clip_norm_W": 1.0,
+        "context_window": 8,
+        "batch_size": 8,
+        "num_steps": 120,
+        "eval_interval": 10,
+        "eval_iters": 2,
+        "results_dir": str(tmp_path),
+        "safe_speed": False,
+        "snapshot_interval": 0,
+        "snapshot_on_shift": False,
+        "reversibility_check_interval": 0,
+    }
+    config.update(over)
+    return config
+
+
+def test_adaptive_dt_does_not_collapse_while_loss_falls(tmp_path):
+    """H_drift used to be (L0 - L)/L0, so learning itself shrank dt to dt_min."""
+    torch.manual_seed(0)
+    trainer = Trainer(_learning_config(tmp_path))
+    _tiny_setup(trainer)
+    list(trainer.train())
+    hist = trainer.get_history()
+    assert hist["test_l"][-1] < hist["test_l"][0] * 0.8  # it is learning
+    assert trainer._current_dt > trainer.config["dt_min"] * 10
+    assert max(hist["H_drift"]) < trainer.config["drift_high"]
+
+
+def test_h_drift_is_a_one_step_error_not_loss_progress(tmp_path):
+    torch.manual_seed(0)
+    trainer = Trainer(
+        _learning_config(tmp_path, integrator="leapfrog", adaptive_dt=False, dt=0.01)
+    )
+    _tiny_setup(trainer)
+    list(trainer.train())
+    hist = trainer.get_history()
+    loss_progress = (hist["test_l"][0] - hist["test_l"][-1]) / hist["test_l"][0]
+    assert loss_progress > 0.2
+    assert max(hist["H_drift"]) < 1e-3
+
+
+def test_fisher_mass_is_not_pinned_to_its_floor(tmp_path):
+    torch.manual_seed(0)
+    trainer = Trainer(_learning_config(tmp_path, num_steps=20))
+    _tiny_setup(trainer)
+    list(trainer.train())
+    mass = trainer.mass_vector
+    assert mass.shape == trainer.E.shape
+    assert torch.unique(mass).numel() > 1
+    assert float(mass.max()) > 10 * trainer._fisher_cfg.eps
+
+
+def test_history_steps_are_actual_eval_steps(tmp_path):
+    torch.manual_seed(0)
+    trainer = Trainer(_tiny_config(tmp_path, num_steps=5))
+    _tiny_setup(trainer)
+    list(trainer.train())
+    assert trainer.get_history()["steps"] == [2, 4, 5]
+
+
+def test_load_refuses_arbitrary_pickled_objects(tmp_path):
+    torch.manual_seed(0)
+    trainer = Trainer(_tiny_config(tmp_path))
+    _tiny_setup(trainer)
+    list(trainer.train())
+    path = os.path.join(trainer.save_dir, "checkpoint_latest.pt")
+    blob = torch.load(path, map_location="cpu", weights_only=True)
+    blob["payload"] = _NotATensor()
+    torch.save(blob, path)
+    assert Trainer(_tiny_config(tmp_path)).load_checkpoint(path) is False
+    assert Trainer(_tiny_config(tmp_path)).load_checkpoint(path, trusted=True) is True
+
+
+class _NotATensor:
+    """Stand-in for an object a malicious checkpoint could smuggle in."""

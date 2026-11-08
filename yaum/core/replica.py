@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
 
 import torch
 
@@ -60,7 +59,7 @@ def attempt_swap(
     beta_a: float,
     beta_b: float,
     *,
-    rng: Optional[torch.Generator] = None,
+    rng: torch.Generator | None = None,
 ) -> bool:
     """Maybe exchange the configurations of two replicas in place.
 
@@ -111,7 +110,7 @@ class ReplicaEnsemble:
         return len(self.states)
 
     def sweep_once(
-        self, *, rng: Optional[torch.Generator] = None
+        self, *, rng: torch.Generator | None = None
     ) -> list[bool]:
         """Attempt one round of adjacent-pair swaps (even- or odd-offset)."""
         start = self._sweep % 2

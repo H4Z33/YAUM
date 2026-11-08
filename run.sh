@@ -20,9 +20,11 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 if command -v nvidia-smi >/dev/null 2>&1; then
-    echo "[yaum] NVIDIA GPU detected. Using CUDA-enabled PyTorch from requirements.txt."
+    echo "[yaum] NVIDIA GPU detected. Using CUDA-enabled PyTorch (requirements.txt)."
+    REQUIREMENTS="requirements.txt"
 else
-    echo "[yaum] No NVIDIA GPU detected. Warning: CUDA build will be used on CPU."
+    echo "[yaum] No NVIDIA GPU detected. Using CPU/MPS PyTorch (requirements-cpu.txt)."
+    REQUIREMENTS="requirements-cpu.txt"
 fi
 
 # Ensure .venv exists
@@ -33,7 +35,7 @@ fi
 
 # Always sync dependencies
 echo "[yaum] Syncing dependencies..."
-uv pip install -r requirements.txt --index-strategy unsafe-best-match
+uv pip install -r "$REQUIREMENTS" --index-strategy unsafe-best-match
 if [ $? -ne 0 ]; then
     echo "[yaum] Dependency sync failed."
     exit 1

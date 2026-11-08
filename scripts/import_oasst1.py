@@ -20,11 +20,10 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from huggingface_hub import hf_hub_download
-
 
 READY_MESSAGES = "2023-04-12_oasst_ready.messages.jsonl.gz"
 ROLE_LABELS = {

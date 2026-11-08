@@ -15,8 +15,15 @@ the shadow system and ``O(dt^p)`` close to the true one. So a spike in
 something non-conservative (noise, clipping, checkpoint reload) has
 perturbed the state.
 
-This module is pure Python with no PyTorch dependency — the trainer
-feeds it scalars pulled from ``EnergyReport``.
+The trainer calls :meth:`ActionAccumulator.accumulate` on **every**
+step with the increment ``(T − V)·dt`` (kept as a device tensor so no
+host sync is forced) and :meth:`ActionAccumulator.observe` on eval
+steps to read the running total. :meth:`update` remains for callers
+that integrate scalars directly.
+
+Caveat: ``V`` is the minibatch loss and the weights ``W`` change every
+step, so ``L`` is not the Lagrangian of a fixed system — ``S`` is a
+bookkeeping integral, not something the trajectory extremizes.
 """
 from __future__ import annotations
 
@@ -47,12 +54,14 @@ class ActionAccumulator:
         self._L: float = 0.0
         self._dS: float = 0.0
         self._steps: int = 0
+        self._last_observed_S: float = 0.0
 
     def reset(self) -> None:
         self._S = 0.0
         self._L = 0.0
         self._dS = 0.0
         self._steps = 0
+        self._last_observed_S = 0.0
 
     def update(self, kinetic: float, potential: float, dt: float) -> ActionReport:
         if dt < 0.0:
@@ -65,8 +74,27 @@ class ActionAccumulator:
         self._steps += 1
         return ActionReport(S=self._S, L=L, dS=dS)
 
+    def accumulate(self, dS) -> None:
+        """Add one step's increment ``(T − V)·dt``.
+
+        ``dS`` may be a float or a 0-d tensor; tensors stay on their
+        device until :meth:`observe` or :meth:`report` reads them.
+        """
+        self._S = self._S + dS
+        self._steps += 1
+
+    def observe(self, kinetic: float, potential: float) -> ActionReport:
+        """Record the current Lagrangian and return the running total."""
+        L = float(kinetic) - float(potential)
+        S = float(self._S)
+        self._dS = S - getattr(self, "_last_observed_S", 0.0)
+        self._last_observed_S = S
+        self._S = S
+        self._L = L
+        return ActionReport(S=S, L=L, dS=self._dS)
+
     def report(self) -> ActionReport:
-        return ActionReport(S=self._S, L=self._L, dS=self._dS)
+        return ActionReport(S=float(self._S), L=self._L, dS=self._dS)
 
     @property
     def steps(self) -> int:

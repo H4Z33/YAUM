@@ -1,0 +1,4 @@
+# YAUM requirements — CPU build of PyTorch (Linux without NVIDIA, macOS incl. MPS).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0
+-r requirements-common.txt

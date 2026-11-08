@@ -8,11 +8,16 @@ invariant under bit-exact save/load but sensitive to any tampering:
     E_norm  = ||E||_2
     P_norm  = ||P||_2
 
-On load we recompute these and compare. Any deviation beyond a tight
-tolerance indicates the state has been altered or corrupted between
-save and load. This is cheaper than a full hash and — unlike a hash —
-carries physical meaning: ``kinetic`` is an actual observable of the
-system, not an opaque digest.
+On load we recompute these and compare. A mismatch means the phase
+state was corrupted or altered between save and load (bit rot, a
+truncated write, a tensor swapped by hand).
+
+What this is **not**: a security mechanism. Anyone who edits ``E`` or
+``P`` can recompute the three scalars, and the check runs only after the
+file has been unpickled. Protection against malicious files comes from
+loading with ``weights_only=True`` (see
+:func:`yaum.core.trainer.load_checkpoint_file`); for tamper evidence use
+a cryptographic hash or signature kept outside the checkpoint.
 """
 from __future__ import annotations
 
@@ -31,7 +36,7 @@ class CheckpointIntegrity:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "CheckpointIntegrity":
+    def from_dict(cls, data: dict) -> CheckpointIntegrity:
         return cls(
             kinetic=float(data["kinetic"]),
             E_norm=float(data["E_norm"]),

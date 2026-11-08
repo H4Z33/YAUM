@@ -1,25 +1,38 @@
 """Information-geometric mass for the embedding particle system.
 
 Treating ``mass`` as ``torch.ones(vocab, 1)`` is an unforced geometric
-choice. The natural metric on any probability-output model is the Fisher
-information: the quadratic form ``F_{ij} = E[∂ log p_i · ∂ log p_j]``
-that measures how sharply the output distribution responds to a
-parameter perturbation. Using it as mass turns the Hamiltonian flow on
-embeddings into natural-gradient dynamics — steep directions become
-heavy and move slowly, flat directions stay light and explore freely.
+choice. A data-dependent alternative is to make coordinates that feel
+large, persistent forces heavy and coordinates that feel small forces
+light.
 
-The full Fisher matrix on the embedding table has shape
-``(V*d, V*d)`` which is unusable. We maintain a **diagonal empirical
-Fisher** of shape ``(V, d)`` — one scalar per embedding coordinate —
-updated by an EMA over recent minibatches. That tensor broadcasts
-elementwise against ``P`` and ``E`` in every integrator step, so
-swapping ``mass_mode: "fisher"`` into the config needs no integrator
-changes at all.
+We keep an EMA of the **squared force** per embedding coordinate,
+``v ≈ E[g²]`` (the diagonal empirical Fisher of the loss w.r.t. ``E``),
+and use
+
+    mass = sqrt(v) + eps
+
+This is the RMSProp/Adam preconditioner expressed as an inertia: the
+acceleration ``F / m ≈ g / sqrt(E[g²])`` is O(1) whatever the raw
+gradient scale, so ``dt`` has the same meaning across batch sizes,
+context lengths and vocabularies. (Using ``mass = v`` instead gives an
+acceleration ~ 1/g that blows up in flat directions — and because the
+raw ``v`` of a mean loss is ~1e-7, any fixed floor such as 1e-3 would
+swallow it entirely.)
+
+Two details keep the time-varying mass from injecting energy:
+
+* the EMA is **sparse** — only rows that appeared in the batch are
+  updated, so the mass of an unseen token never decays while it still
+  carries momentum (a shrinking mass at fixed ``P`` would speed it up);
+* a row's first observation initialises ``v`` directly instead of being
+  blended with zero, which removes the EMA start-up bias.
+
+A changing mass still makes the dynamics only piecewise-Hamiltonian:
+each step is symplectic for the mass it was taken with.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +41,9 @@ import torch.nn.functional as F
 @dataclass
 class FisherMassConfig:
     beta: float = 0.9
-    eps: float = 1e-3
+    #: Absolute floor added to ``sqrt(v)``; the analogue of Adam's epsilon.
+    eps: float = 1e-8
+    #: Kept for config compatibility; the trainer now updates every step.
     refresh_every: int = 50
     batches_per_refresh: int = 4
 
@@ -81,40 +96,70 @@ def fisher_diagonal_sample(
 
 
 class FisherMassEstimator:
-    """EMA-smoothed diagonal empirical Fisher on the embedding table.
+    """Sparse EMA of the squared force, exposed as an RMS mass.
 
-    Initialised to the ``eps`` floor everywhere (so unseen tokens still
-    have a finite mass). Calling :meth:`update` blends a new sample into
-    the running estimate with decay ``beta`` and re-applies the floor.
+    ``second_moment`` holds ``v``; :meth:`current` returns
+    ``sqrt(v) + eps``. Before any observation every coordinate has
+    ``v = 0`` and therefore mass ``eps``; the trainer warms the estimator
+    up on a few batches before the first step.
     """
 
     def __init__(self, shape: tuple[int, int], config: FisherMassConfig):
         self.shape = tuple(shape)
         self.config = config
-        self.mass: Optional[torch.Tensor] = None
+        self.second_moment: torch.Tensor | None = None
+        self.mass: torch.Tensor | None = None
         self._update_count = 0
 
     def initialise(self, device, dtype) -> torch.Tensor:
-        self.mass = torch.full(
-            self.shape, self.config.eps, device=device, dtype=dtype
-        )
+        self.second_moment = torch.zeros(self.shape, device=device, dtype=dtype)
+        self._refresh_mass()
         return self.mass
+
+    def load_mass(self, mass: torch.Tensor) -> None:
+        """Restore state from a saved mass tensor (inverts :meth:`current`)."""
+        if tuple(mass.shape) != self.shape:
+            raise ValueError(
+                f"mass shape {tuple(mass.shape)} != expected {self.shape}"
+            )
+        root = torch.clamp(mass.detach() - self.config.eps, min=0.0)
+        self.second_moment = root * root
+        self._refresh_mass()
+        self._update_count = max(self._update_count, 1)
+
+    def _refresh_mass(self) -> None:
+        self.mass = torch.sqrt(self.second_moment) + self.config.eps
 
     def current(self) -> torch.Tensor:
         if self.mass is None:
             raise RuntimeError("FisherMassEstimator not initialised")
         return self.mass
 
-    def update(self, sample: torch.Tensor) -> torch.Tensor:
-        if sample.shape != self.shape:
+    def update(
+        self, sample: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Blend ``sample`` (a squared force) into ``v``; return the new mass.
+
+        ``mask`` selects the coordinates that were observed. By default a
+        coordinate counts as observed when its sample is non-zero, which
+        for a scattered embedding force means "the token was in the batch".
+        """
+        if tuple(sample.shape) != self.shape:
             raise ValueError(
                 f"Fisher sample shape {tuple(sample.shape)} != expected {self.shape}"
             )
-        if self.mass is None:
+        if self.second_moment is None:
             self.initialise(sample.device, sample.dtype)
+        sample = sample.detach()
+        if mask is None:
+            mask = sample > 0
+        v = self.second_moment
         beta = self.config.beta
-        self.mass.mul_(beta).add_(sample.detach(), alpha=1.0 - beta)
-        self.mass.clamp_(min=self.config.eps)
+        blended = beta * v + (1.0 - beta) * sample
+        first_seen = v == 0
+        new_v = torch.where(first_seen, sample, blended)
+        v.copy_(torch.where(mask, new_v, v))
+        self._refresh_mass()
         self._update_count += 1
         return self.mass
 

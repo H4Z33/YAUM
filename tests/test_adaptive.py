@@ -7,16 +7,16 @@ from yaum.core.adaptive import AdaptiveStepController
 
 
 def _make(**overrides):
-    base = dict(
-        dt_init=0.01,
-        dt_min=1e-4,
-        dt_max=0.1,
-        drift_high=1e-3,
-        drift_low=1e-5,
-        shrink=0.5,
-        grow=2.0,
-        grow_after=3,
-    )
+    base = {
+        "dt_init": 0.01,
+        "dt_min": 1e-4,
+        "dt_max": 0.1,
+        "drift_high": 1e-3,
+        "drift_low": 1e-5,
+        "shrink": 0.5,
+        "grow": 2.0,
+        "grow_after": 3,
+    }
     base.update(overrides)
     return AdaptiveStepController(**base)
 

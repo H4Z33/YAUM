@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class TransformerCharModel(nn.Module):

@@ -1,11 +1,9 @@
 """Specs for the Fisher-information mass estimator."""
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 from yaum.core.geometry import (
     FisherMassConfig,
@@ -13,7 +11,6 @@ from yaum.core.geometry import (
     fisher_diagonal_sample,
 )
 from yaum.models.rnn import RNNCharModel
-
 
 # ---- config validation ---------------------------------------------------
 
@@ -51,26 +48,54 @@ def test_estimator_initialises_to_eps_floor():
     assert torch.all(m == 0.5)
 
 
-def test_estimator_update_blends_sample_via_beta():
-    cfg = FisherMassConfig(beta=0.5, eps=1e-6)
+def test_estimator_mass_is_rms_of_force():
+    cfg = FisherMassConfig(beta=0.5, eps=1e-8)
     est = FisherMassEstimator(shape=(2, 2), config=cfg)
     est.initialise("cpu", torch.float32)
-    prior = est.current().clone()
-    sample = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    new = est.update(sample)
-    expected = 0.5 * prior + 0.5 * sample
-    assert torch.allclose(new, expected)
-    assert est.update_count == 1
+    first = torch.tensor([[1.0, 4.0], [9.0, 16.0]])
+    m1 = est.update(first)
+    # First observation initialises v directly (no blend with zero).
+    assert torch.allclose(m1, first.sqrt(), atol=1e-6)
+    second = torch.tensor([[3.0, 4.0], [9.0, 0.5]])
+    m2 = est.update(second)
+    assert torch.allclose(m2, (0.5 * first + 0.5 * second).sqrt(), atol=1e-6)
+    assert est.update_count == 2
 
 
-def test_estimator_enforces_floor_after_update():
-    cfg = FisherMassConfig(beta=0.0, eps=0.25)
-    est = FisherMassEstimator(shape=(2,), config=cfg)
+def test_estimator_is_scale_invariant_in_acceleration():
+    """F / m should not depend on the raw gradient scale."""
+    cfg = FisherMassConfig(beta=0.0, eps=1e-12)
+    g = torch.tensor([[0.3, -0.7], [1.2, 0.05]])
+    accel = []
+    for scale in (1e-4, 1.0):
+        est = FisherMassEstimator(shape=(2, 2), config=cfg)
+        est.initialise("cpu", torch.float32)
+        m = est.update((g * scale) ** 2)
+        accel.append((g * scale) / m)
+    assert torch.allclose(accel[0], accel[1], atol=1e-5)
+
+
+def test_estimator_leaves_unseen_rows_untouched():
+    cfg = FisherMassConfig(beta=0.5, eps=1e-8)
+    est = FisherMassEstimator(shape=(2, 2), config=cfg)
     est.initialise("cpu", torch.float32)
-    est.update(torch.tensor([0.1, 2.0]))
-    m = est.current()
-    assert m[0] == 0.25  # floored
-    assert m[1] == 2.0   # left alone
+    est.update(torch.tensor([[4.0, 4.0], [4.0, 4.0]]))
+    before = est.current().clone()
+    m = est.update(torch.tensor([[1.0, 1.0], [0.0, 0.0]]))
+    assert torch.allclose(m[1], before[1])  # row 1 not in batch: mass frozen
+    assert torch.all(m[0] < before[0])
+
+
+def test_estimator_load_mass_round_trips():
+    cfg = FisherMassConfig(beta=0.9, eps=1e-6)
+    est = FisherMassEstimator(shape=(2, 3), config=cfg)
+    est.initialise("cpu", torch.float32)
+    est.update(torch.rand(2, 3) + 0.1)
+    saved = est.current().clone()
+    fresh = FisherMassEstimator(shape=(2, 3), config=cfg)
+    fresh.load_mass(saved)
+    assert torch.allclose(fresh.current(), saved, atol=1e-6)
+    assert fresh.update_count >= 1
 
 
 def test_estimator_rejects_sample_shape_mismatch():

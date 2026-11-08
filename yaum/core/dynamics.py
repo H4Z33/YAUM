@@ -20,8 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .integrators import ForceField, LeapfrogIntegrator
 
@@ -143,7 +143,7 @@ class EnergyReport:
     potential: float
     total: float
 
-    def drift(self, reference: "EnergyReport") -> float:
+    def drift(self, reference: EnergyReport) -> float:
         ref = abs(reference.total)
         if ref < 1e-12:
             return abs(self.total - reference.total)

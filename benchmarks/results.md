@@ -1,16 +1,21 @@
+# Benchmark results
 
-## Run seed=0 steps=300
+Appended by `python -m benchmarks.compare_training`. Runs before the
+audit fixes (November 2026) were removed: their `peak |ΔH/H|` measured how
+far the loss had fallen, not integrator error, and the "Fisher" mass
+was a constant pinned to its floor, so those numbers are not comparable.
 
-| variant | wall (s) | force evals | final train | final test | best test | peak |ΔH/H| |
-|---|---:|---:|---:|---:|---:|---:|
-| `baseline_adam` | 4.18 | 300 | 0.4984 | 0.5074 | 0.5119 | — |
-| `yaum_leapfrog` | 4.79 | 600 | 0.5333 | 0.5408 | 0.5459 | 8.34e-01 |
-| `yaum_yoshida4` | 7.63 | 1800 | 0.5333 | 0.5408 | 0.5459 | 8.34e-01 |
+## Run steps=600 seeds=[0, 1, 2]
 
-## Conclusions
+| variant | held-out loss | ‖E−E₀‖/‖E₀‖ | max one-step \|ΔH/H\| | wall (s) |
+|---|---:|---:|---:|---:|
+| `frozen_E` | 0.2206 ± 0.0073 | 0.00 | — | 1.5 |
+| `adam_E` | 0.1978 ± 0.0049 | 0.29 | — | 1.6 |
+| `adam_E_tuned` | 0.1708 ± 0.0046 | 1.88 | — | 1.5 |
+| `yaum_static` | 0.1989 ± 0.0038 | 0.33 | 3.1e-07 | 3.3 |
+| `yaum_fisher` | 0.1686 ± 0.0080 | 7.61 | 5.3e-07 | 3.3 |
+| `yaum_damped` | 0.1699 ± 0.0065 | 2.76 | 4.3e-05 | 3.4 |
 
-- **Best test loss — YAUM leapfrog vs Adam-on-E:** ↑ 0.0341 (+6.7%).
-- **Best test loss — YAUM yoshida4 vs Adam-on-E:** ↑ 0.0341 (+6.7%).
-- **Leapfrog gives a new diagnostic Adam cannot:** peak |ΔH/H| = 8.34e-01. This is the single number that tells you the integrator is losing (or gaining) energy against the loss landscape — a failure mode invisible to a plain optimiser.
-- **Wall-time cost of symplectic E:** 1.15× baseline (600 force evals vs 300 for Adam — leapfrog evaluates the gradient twice per step).
-- **Yoshida4 vs leapfrog:** 1.59× wall time for 3.0× the force evaluations. On this dataset the trajectories agree to float32 precision — the per-token embedding force is too mild for the fourth-order correction to do visible work, so leapfrog is the right default until forces get stiffer.
+Lowest held-out loss: `yaum_fisher`.
+`yaum_static` vs `frozen_E`: -0.0216 (negative = the dynamics on E help at all).
+`yaum_damped` vs `adam_E_tuned`: -0.0008 (seed std ≈ 0.0065; within seed noise — a tie).

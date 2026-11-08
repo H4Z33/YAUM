@@ -115,7 +115,7 @@ def test_yoshida_is_higher_order_than_leapfrog():
         return torch.tensor([[math.cos(t)]]), torch.tensor([[-math.sin(t)]])
 
     def err(integrator, dt):
-        n = int(round(T / dt))
+        n = round(T / dt)
         x, p = integrate(integrator, x0, p0, mass, force_fn, dt, n)
         xr, pr = exact(n * dt)
         return ((x - xr).abs().max() + (p - pr).abs().max()).item()
@@ -313,3 +313,23 @@ def test_phase_step_carries_loss_and_eval_count():
 
     yosh_step = YoshidaIntegrator().step(x, p, 0.01, force_fn, mass)
     assert yosh_step.n_force_evals == 6
+
+
+def test_langevin_zero_temperature_is_deterministic_and_exposes_core_momenta():
+    mass = torch.ones(3, 1)
+    x0 = torch.randn(3, 2)
+    p0 = torch.randn(3, 2)
+    integrator = LangevinIntegrator(friction=2.0, temperature=0.0)
+    force_fn = harmonic_force(1.0)
+    torch.manual_seed(1)
+    a = integrator.step(x0.clone().requires_grad_(True), p0, 0.05, force_fn, mass, retain_final=False)
+    torch.manual_seed(2)
+    b = integrator.step(x0.clone().requires_grad_(True), p0, 0.05, force_fn, mass, retain_final=False)
+    assert torch.equal(a.E, b.E) and torch.equal(a.P, b.P)
+    # The conservative core conserves energy far better than the damped step.
+    def H(x, p):
+        return float(0.5 * (p * p).sum() + 0.5 * (x * x).sum())
+    E_mid = a.E  # core and full step share the final position
+    core_err = abs(H(E_mid, a.P_conservative_out) - H(x0, a.P_conservative_in))
+    full_err = abs(H(E_mid, a.P) - H(x0, p0))
+    assert core_err < 0.1 * full_err

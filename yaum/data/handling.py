@@ -1,12 +1,12 @@
-import torch
 import pickle
-import os
-from collections import Counter
+
+import torch
+
 
 # --- Tokenization ---
 def tokenize_text(text):
     """Performs character-level tokenization."""
-    chars = sorted(list(set(text)))
+    chars = sorted(set(text))
     vocab_size = len(chars)
     char_to_idx = {ch: i for i, ch in enumerate(chars)}
     idx_to_char = {i: ch for i, ch in enumerate(chars)}

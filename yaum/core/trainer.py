@@ -19,17 +19,17 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.optim as optim
+from torch import optim
 
 from ..data.handling import save_vocab  # noqa: F401 - re-exported for callers
 from ..models import make_model
 from .action import ActionAccumulator
 from .adaptive import AdaptiveStepController
 from .diagnostics import measure_reversibility
-from .dynamics import make_force_fn, total_hamiltonian
-from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
-from .integrators import make_integrator
+from .dynamics import kinetic_energy, make_force_fn, total_hamiltonian
 from .geometry import FisherMassConfig, FisherMassEstimator, fisher_diagonal_sample
+from .integrators import make_integrator
+from .integrity import CheckpointIntegrity, compute_integrity, verify_integrity
 from .observables import ObservableWindow, snapshot
 from .substrate import HamiltonianSubstrate
 from .utils import device, get_batch
@@ -54,11 +54,38 @@ def _fmt_config_value(value):
     return str(value)
 
 
+def load_checkpoint_file(filepath, *, trusted: bool = False):
+    """``torch.load`` a YAUM checkpoint without executing pickled code.
+
+    ``weights_only=True`` restricts unpickling to tensors and plain
+    containers, which is everything a YAUM checkpoint stores. Only set
+    ``trusted=True`` for a file you produced yourself.
+    """
+    return torch.load(filepath, map_location="cpu", weights_only=not trusted)
+
+
+def _integrator_params(config: Mapping) -> dict:
+    """Merge flat UI keys (``friction``, ``temperature``) into integrator params."""
+    params = dict(config.get("integrator_params", {}) or {})
+    for key in ("friction", "temperature"):
+        if key in config and config[key] is not None:
+            params.setdefault(key, float(config[key]))
+    return params
+
+
 TRAINER_DEFAULTS = {
+    # Damped dynamics: a leapfrog core wrapped in friction with no noise.
+    # Pure leapfrog never settles (energy is conserved, so embeddings keep
+    # moving); friction lets them come to rest in a basin.
+    "integrator": "langevin",
+    "friction": 2.0,
+    "temperature": 0.0,
+    "dt": 0.03,
     "mass_mode": "fisher",
+    "fisher_eps": 1e-8,
     "adaptive_dt": True,
-    "dt_min": 0.00001,
-    "dt_max": 0.01,
+    "dt_min": 0.0001,
+    "dt_max": 0.1,
     "drift_high": 0.05,
     "drift_low": 0.001,
     "snapshot_interval": 5000,
@@ -101,8 +128,7 @@ class Trainer:
         self.vocab_size = None
 
         self.integrator = make_integrator(
-            config.get("integrator", "leapfrog"),
-            **config.get("integrator_params", {}),
+            config.get("integrator", "leapfrog"), **_integrator_params(config)
         )
         self.adaptive = self._build_adaptive_controller(config)
 
@@ -124,8 +150,10 @@ class Trainer:
             "action": [],
             "lagrangian": [],
         }
+        self.eval_steps: list[int] = []
         self._eval_counter = 0
         self._energy_reference = None
+        self._drift_window_max = None
         self._last_snapshot_step = 0
         self._last_shift_snapshot_step = 0
         initial_dt = float(config["dt"]) if "dt" in config else 0.01
@@ -229,6 +257,8 @@ class Trainer:
                 "dynamics",
                 (
                     "integrator",
+                    "friction",
+                    "temperature",
                     "mass_type",
                     "mass_mode",
                     "dt",
@@ -336,7 +366,7 @@ class Trainer:
         if self.config.get("mass_mode") == "fisher":
             self._fisher_cfg = FisherMassConfig(
                 beta=float(self.config.get("fisher_beta", 0.9)),
-                eps=float(self.config.get("fisher_eps", 1e-3)),
+                eps=float(self.config.get("fisher_eps", 1e-8)),
                 refresh_every=int(self.config.get("fisher_refresh_every", 50)),
                 batches_per_refresh=int(
                     self.config.get("fisher_batches_per_refresh", 4)
@@ -358,8 +388,10 @@ class Trainer:
             self._fisher_cfg = None
 
         self.current_step = 0
+        self.eval_steps = []
         self._stop_training_flag = False
         self._energy_reference = None
+        self._drift_window_max = None
         self.adaptive = self._build_adaptive_controller(self.config)
         self._current_dt = (
             float(self.adaptive.dt)
@@ -398,6 +430,7 @@ class Trainer:
             return
         cfg = self._fisher_cfg
         accum = torch.zeros_like(self.E)
+        counts = torch.zeros_like(self.E)
         was_training = self.model.training
         if was_training:
             self.model.eval()
@@ -412,18 +445,32 @@ class Trainer:
                     )
                 except ValueError:
                     break
-                accum += fisher_diagonal_sample(
+                sample = fisher_diagonal_sample(
                     self.model, self.criterion, self.E, x, y
                 )
-            accum /= max(cfg.batches_per_refresh, 1)
-            self._fisher.update(accum)
+                accum += sample
+                counts += (sample > 0).to(accum.dtype)
+            # Average each coordinate over the batches it actually appeared in.
+            observed = counts > 0
+            accum = accum / counts.clamp(min=1.0)
+            self._fisher.update(accum, mask=observed)
             self.mass_vector = self._fisher.current()
         finally:
             if was_training:
                 self.model.train()
 
     def _run_reversibility_probe(self, x_batch, y_batch) -> float:
-        """Integrate forward/backward on the current batch and return residual."""
+        """Integrate forward/backward on the current batch and return residual.
+
+        With frozen weights and a fixed batch a deterministic symplectic
+        integrator is reversible up to round-off by construction, so this
+        probe checks numerical health (float precision, nondeterministic
+        kernels, a dt far too large for the curvature) — not the training
+        dynamics, which are not autonomous. Stochastic integrators are not
+        reversible at all, so they report NaN.
+        """
+        if self._integrator_is_stochastic():
+            return float("nan")
         was_training = self.model.training
         if was_training:
             self.model.eval()
@@ -452,14 +499,34 @@ class Trainer:
             if was_training:
                 self.model.train()
 
+    def _integrator_is_stochastic(self) -> bool:
+        integ = self.integrator
+        while integ is not None:
+            if getattr(integ, "name", "") == "langevin" and getattr(integ, "gamma", 0.0) > 0:
+                return True
+            integ = getattr(integ, "core", None) or getattr(integ, "inner", None)
+        return False
+
     def _step_embeddings(self, x_batch, y_batch):
-        """Run one integrator step and return (new_E, new_P, loss1, loss2)."""
-        force_fn = make_force_fn(x_batch, y_batch, self.model, self.criterion)
+        """Run one integrator step.
+
+        Returns ``(new_E, new_P, loss1, loss2, force0)`` where ``force0`` is
+        the force at the starting position (used for the Fisher mass).
+        """
+        base_force_fn = make_force_fn(x_batch, y_batch, self.model, self.criterion)
+        recorded: dict[str, torch.Tensor] = {}
+
+        def force_fn(E, *, retain_graph):
+            loss, force = base_force_fn(E, retain_graph=retain_graph)
+            recorded.setdefault("force", force.detach())
+            return loss, force
+
         self._sync_substrate()
         if self.substrate is None:
             raise RuntimeError("Hamiltonian substrate is not initialized.")
         step = self.substrate.propose(force_fn, retain_final=True)
-        return step.E, step.P, step.loss_initial, step.loss_final
+        self._last_phase_step = step
+        return step.E, step.P, step.loss_initial, step.loss_final, recorded.get("force")
 
     def train(self):
         if not self.model or self.E is None:
@@ -483,9 +550,6 @@ class Trainer:
                 yield {"status": "stopped", "step": step}
                 break
 
-            # Fisher mass is now updated amortized inside _step_embeddings.
-            # We no longer need periodic lump refreshes.
-
             x_batch, y_batch = get_batch(
                 self.train_data,
                 self.config["context_window"],
@@ -495,22 +559,58 @@ class Trainer:
 
             try:
                 P_prev = self.P
-                E_new, P_new, loss_l1, loss_l2 = self._step_embeddings(x_batch, y_batch)
+                mass_used = self.mass_vector
+                E_new, P_new, loss_l1, loss_l2, force0 = self._step_embeddings(
+                    x_batch, y_batch
+                )
 
-                # Update Fisher mass amortized once per step (fast, in-GPU EMA)
-                if self._fisher is not None:
-                    with torch.no_grad():
-                        force = (P_new - P_prev) / (-self._current_dt)
-                        self._fisher.update(force * force)
+                with torch.no_grad():
+                    # One-step energy error of the integrator. Both endpoints
+                    # use the same batch, the same weights W (they are only
+                    # updated below) and the same mass, so this is a genuine
+                    # integrator diagnostic rather than "how much did the
+                    # loss go down since the first eval".
+                    phase = getattr(self, "_last_phase_step", None)
+                    if phase is not None and phase.P_conservative_in is not None:
+                        # Damped/thermostatted run: measure the conservative
+                        # core only, not the heat exchanged with the bath.
+                        T0 = kinetic_energy(phase.P_conservative_in, mass_used)
+                        T1 = kinetic_energy(phase.P_conservative_out, mass_used)
+                    else:
+                        T0 = kinetic_energy(P_prev, mass_used)
+                        T1 = kinetic_energy(P_new, mass_used)
+                    self._last_phase_step = None
+                    H0 = T0 + loss_l1.detach()
+                    H1 = T1 + loss_l2.detach()
+                    step_drift = (H1 - H0).abs() / H0.abs().clamp(min=1e-12)
+                    if self._drift_window_max is None:
+                        self._drift_window_max = step_drift
+                    else:
+                        self._drift_window_max = torch.maximum(
+                            self._drift_window_max, step_drift
+                        )
+                    self._action.accumulate(
+                        (T1 - loss_l2.detach()) * self._current_dt
+                    )
+
+                    # Fisher mass: sparse EMA of the squared force at the
+                    # step's starting point. Takes effect from the next step.
+                    # Momentum is rescaled so velocity P/m is continuous
+                    # across the mass change; holding P fixed instead would
+                    # make a coordinate whose mass drops suddenly fly off.
+                    if self._fisher is not None and force0 is not None:
+                        old_mass = self.mass_vector
+                        self._fisher.update(force0 * force0)
                         self.mass_vector = self._fisher.current()
+                        P_new = P_new * (self.mass_vector / old_mass)
             except Exception as e:
                 print(f"ERROR during integrator step {step}: {e}")
                 yield {"status": "error", "message": f"Integrator step failed: {e}"}
                 break
 
-            if torch.isnan(loss_l1) or torch.isnan(loss_l2):
-                print(f"ERROR: NaN loss detected at step {step}. Stopping training.")
-                yield {"status": "error", "message": f"NaN loss at step {step}"}
+            if not (torch.isfinite(loss_l1) and torch.isfinite(loss_l2)):
+                print(f"ERROR: non-finite loss detected at step {step}. Stopping training.")
+                yield {"status": "error", "message": f"Non-finite loss at step {step}"}
                 break
 
             self.optimizer_W.zero_grad()
@@ -554,16 +654,20 @@ class Trainer:
                     sum(p.grad.data.norm(2).item() ** 2
                         for p in self.model.parameters() if p.grad is not None) ** 0.5
                 )
-                energy = total_hamiltonian(self.P, self.mass_vector, loss_l2)
-                if self._energy_reference is None:
-                    self._energy_reference = energy
-                h_drift = energy.drift(self._energy_reference)
+                energy = total_hamiltonian(P_new, mass_used, loss_l2)
+                # Worst per-step relative energy error since the last eval.
+                h_drift = (
+                    float(self._drift_window_max)
+                    if self._drift_window_max is not None
+                    else float("nan")
+                )
+                self._drift_window_max = None
 
                 self._observables.push(snapshot(self.E, H=energy.total))
-                action_report = self._action.update(
-                    kinetic=energy.kinetic, potential=energy.potential, dt=self._current_dt
+                action_report = self._action.observe(
+                    kinetic=energy.kinetic, potential=energy.potential
                 )
-                if self.adaptive is not None:
+                if self.adaptive is not None and np.isfinite(h_drift):
                     self._current_dt = self.adaptive.observe(h_drift)
 
             eval_results = self.evaluate()
@@ -582,6 +686,7 @@ class Trainer:
             else:
                 c_v = chi = tau = s_rate = float("nan")
 
+            self.eval_steps.append(self.current_step)
             self.train_losses_l1.append(loss_l1.item())
             self.train_losses_l2.append(loss_l2.item())
             self.test_losses.append(test_loss)
@@ -672,7 +777,7 @@ class Trainer:
                     time.sleep(0.001)
 
                 # Each batch is sampled from random positions, so the hidden
-                # state must be reset per batch â€” persisting it across
+                # state must be reset per batch — persisting it across
                 # unrelated windows was silently corrupting the eval signal.
                 hidden = self.model.init_hidden(eval_batch_size)
 
@@ -846,6 +951,7 @@ class Trainer:
             "train_losses_l1": self.train_losses_l1,
             "train_losses_l2": self.train_losses_l2,
             "test_losses": self.test_losses,
+            "eval_steps": self.eval_steps,
             "debug_stats": self.debug_stats,
             "char_to_idx": self.char_to_idx,
             "idx_to_char": self.idx_to_char,
@@ -857,11 +963,15 @@ class Trainer:
         except Exception as e:
             print(f"Error saving checkpoint: {e}")
 
-    def load_checkpoint(self, filepath):
+    def load_checkpoint(self, filepath, *, trusted: bool = False):
+        """Load a checkpoint.
+
+        Checkpoints are read with ``weights_only=True`` so a malicious file
+        cannot execute code while being unpickled. Pass ``trusted=True`` only
+        for files you created yourself that predate this format.
+        """
         try:
-            checkpoint = torch.load(
-                filepath, map_location="cpu", weights_only=False
-            )
+            checkpoint = load_checkpoint_file(filepath, trusted=trusted)
             print(f"Loading checkpoint from {filepath}...")
 
             saved_fp = checkpoint.get("integrity")
@@ -895,7 +1005,7 @@ class Trainer:
             self.idx_to_char = checkpoint["idx_to_char"]
             self.integrator = make_integrator(
                 self.config.get("integrator", "leapfrog"),
-                **self.config.get("integrator_params", {}),
+                **_integrator_params(self.config),
             )
 
             self.model = make_model(self.vocab_size, self.config).to(device)
@@ -906,22 +1016,35 @@ class Trainer:
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.E = checkpoint["E"].to(device).requires_grad_(True)
             self.P = checkpoint["P"].to(device)
-            if "mass_vector" in checkpoint and checkpoint["mass_vector"] is not None:
-                self.mass_vector = checkpoint["mass_vector"].to(device)
+            saved_mass = checkpoint.get("mass_vector")
+            if saved_mass is not None:
+                self.mass_vector = saved_mass.to(device)
+            elif self.config.get("mass_mode") != "fisher":
+                print("Checkpoint has no mass_vector; falling back to uniform mass.")
+                self.mass_vector = torch.ones(self.vocab_size, 1, device=device)
             if self.config.get("mass_mode") == "fisher":
                 self._fisher_cfg = FisherMassConfig(
                     beta=float(self.config.get("fisher_beta", 0.9)),
-                    eps=float(self.config.get("fisher_eps", 1e-3)),
+                    eps=float(self.config.get("fisher_eps", 1e-8)),
                     refresh_every=int(self.config.get("fisher_refresh_every", 50)),
                     batches_per_refresh=int(
                         self.config.get("fisher_batches_per_refresh", 4)
                     ),
                 )
                 self._fisher = FisherMassEstimator(
-                    shape=tuple(self.mass_vector.shape),
+                    shape=tuple(self.E.shape),
                     config=self._fisher_cfg,
                 )
-                self._fisher.mass = self.mass_vector
+                if (
+                    self.mass_vector is not None
+                    and tuple(self.mass_vector.shape) == tuple(self.E.shape)
+                ):
+                    self._fisher.load_mass(self.mass_vector)
+                else:
+                    # Legacy checkpoint: no per-coordinate mass to resume
+                    # from, so the estimator warms up again on first train().
+                    self._fisher.initialise(device, self.E.dtype)
+                    self.mass_vector = self._fisher.current()
             else:
                 self._fisher = None
                 self._fisher_cfg = None
@@ -930,6 +1053,13 @@ class Trainer:
             self.train_losses_l1 = checkpoint["train_losses_l1"]
             self.train_losses_l2 = checkpoint["train_losses_l2"]
             self.test_losses = checkpoint["test_losses"]
+            eval_interval = int(self.config.get("eval_interval", 1))
+            self.eval_steps = list(
+                checkpoint.get(
+                    "eval_steps",
+                    [(i + 1) * eval_interval for i in range(len(self.test_losses))],
+                )
+            )
             loaded_debug = checkpoint["debug_stats"]
             # Back-compat: older checkpoints may be missing any of these columns.
             n = len(self.test_losses)
@@ -956,6 +1086,7 @@ class Trainer:
             )
             self.save_dir = os.path.dirname(filepath)
             self._energy_reference = None
+            self._drift_window_max = None
             self._observables.clear()
             self._action.reset()
             self._last_snapshot_step = self.current_step
@@ -977,8 +1108,11 @@ class Trainer:
         self._stop_training_flag = True
 
     def get_history(self):
-        eval_interval = self.config.get("eval_interval", 1)
-        steps = list(np.arange(len(self.test_losses)) * eval_interval)
+        if len(self.eval_steps) == len(self.test_losses):
+            steps = list(self.eval_steps)
+        else:
+            eval_interval = int(self.config.get("eval_interval", 1))
+            steps = [(i + 1) * eval_interval for i in range(len(self.test_losses))]
         return {
             "steps": steps,
             "train_l1": self.train_losses_l1,

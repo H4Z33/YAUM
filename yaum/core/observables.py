@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional
 
 import torch
 
@@ -47,7 +46,7 @@ def embedding_entropy_logdet(E: torch.Tensor, eps: float = 1e-6) -> float:
         return 0.5 * float(logabsdet)
 
 
-def integrated_autocorr(series: list[float], max_lag: Optional[int] = None) -> float:
+def integrated_autocorr(series: list[float], max_lag: int | None = None) -> float:
     """Integrated autocorrelation time of a scalar series.
 
     τ_int = 1 + 2 Σ_k ρ(k) truncated at the first non-positive ρ. For an
@@ -111,7 +110,7 @@ class ObservableWindow:
         if size < 2:
             raise ValueError("window size must be >= 2")
         self.size = int(size)
-        self._buf: Deque[ObservableRecord] = deque(maxlen=self.size)
+        self._buf: deque[ObservableRecord] = deque(maxlen=self.size)
 
     def __len__(self) -> int:
         return len(self._buf)
@@ -122,7 +121,7 @@ class ObservableWindow:
     def push(self, record: ObservableRecord) -> None:
         self._buf.append(record)
 
-    def report(self) -> Optional[ObservableReport]:
+    def report(self) -> ObservableReport | None:
         if len(self._buf) < 2:
             return None
         Hs = [r.H for r in self._buf if r.H == r.H]  # drop NaN

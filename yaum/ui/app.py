@@ -1,8 +1,9 @@
-import gradio as gr
-import sys
 import os
+import sys
 import threading
 import time
+
+import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -12,13 +13,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 # --- Imports from your project ---
 try:
-    from yaum.data.handling import load_and_split_data, calculate_mass_vector
-    from yaum.core.trainer import Trainer
-    from yaum.core.utils import device # Import device info
+    from yaum.core.trainer import Trainer, load_checkpoint_file
+    from yaum.core.utils import device  # Import device info
+    from yaum.data.handling import calculate_mass_vector, load_and_split_data
 except ImportError as e:
      print(f"Error importing project modules: {e}")
      print("Please ensure the script is run from the project root directory (e.g., using 'python -m yaum.ui.app') or the PYTHONPATH is set correctly.")
      sys.exit(1)
+
+MODEL_CHOICES = ["rnn", "transformer", "hamiltonian"]
+INTEGRATOR_CHOICES = ["langevin", "leapfrog", "yoshida4", "multiscale"]
 
 # --- Global State ---
 # Using global state for simplicity. For more complex apps, consider
@@ -45,9 +49,11 @@ DEFAULT_CONFIG = {
     'context_window': 128,
     'hidden_dim': 256,
     'n_layers': 2,
-    'dt': 0.01,
+    'dt': 0.03,
     'mass_type': 'frequency',
     'mass_mode': 'fisher',
+    'integrator': 'langevin',
+    'friction': 2.0,
     'num_steps': 15000,
     'batch_size': 32,
     'learning_rate_W': 0.001,
@@ -68,8 +74,8 @@ DEFAULT_CONFIG = {
     'reversibility_check_steps': 5,
     'gradient_clip_norm_W': 1.0,
     'adaptive_dt': True,
-    'dt_min': 0.00001,
-    'dt_max': 0.01,
+    'dt_min': 0.0001,
+    'dt_max': 0.1,
     'drift_high': 0.05,
     'drift_low': 0.001,
     'results_dir': 'results', # Base directory for saving runs
@@ -138,23 +144,28 @@ def update_config_value(key, value):
                  value = int(value)
              except (ValueError, TypeError):
                  value = DEFAULT_CONFIG.get(key) # Reset on error
-             if key in {'snapshot_interval', 'snapshot_keep_last', 'reversibility_check_interval'} and value < 0:
-                 value = DEFAULT_CONFIG.get(key)
-             elif key == 'reversibility_check_steps' and value < 1:
+             if key in {'snapshot_interval', 'snapshot_keep_last', 'reversibility_check_interval'} and value < 0 or key == 'reversibility_check_steps' and value < 1:
                  value = DEFAULT_CONFIG.get(key)
          elif key in ['test_split_ratio', 'dt', 'learning_rate_W', 'gradient_clip_norm_W', 'step_delay', 'dt_min', 'dt_max', 'drift_high', 'drift_low']:
              try:
                  value = float(value)
              except (ValueError, TypeError):
                  value = DEFAULT_CONFIG.get(key) # Reset on error
-             if key in {'dt', 'dt_min', 'dt_max', 'drift_high'} and value <= 0:
+             if key in {'dt', 'dt_min', 'dt_max', 'drift_high'} and value <= 0 or key == 'drift_low' and value < 0:
                  value = DEFAULT_CONFIG.get(key)
-             elif key == 'drift_low' and value < 0:
+         elif key == 'friction':
+             try:
+                 value = float(value)
+             except (ValueError, TypeError):
+                 value = DEFAULT_CONFIG.get(key)
+             if value < 0:
                  value = DEFAULT_CONFIG.get(key)
          elif key in ['safe_speed', 'adaptive_dt', 'snapshot_on_shift', 'cudnn_benchmark', 'disable_cudnn']:
              value = bool(value)
          elif key == 'model_type':
-             value = value if value in {'rnn', 'transformer'} else DEFAULT_CONFIG[key]
+             value = value if value in MODEL_CHOICES else DEFAULT_CONFIG[key]
+         elif key == 'integrator':
+             value = value if value in INTEGRATOR_CHOICES else DEFAULT_CONFIG[key]
          elif key == 'mass_mode':
              value = value if value in {'static', 'fisher'} else DEFAULT_CONFIG[key]
          APP_STATE["config"][key] = value
@@ -670,7 +681,7 @@ def restore_default_config():
     # Get all the default values to update UI
     output_component_keys = [
         'data_file', 'test_split_ratio', 'model_type', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
-        'dt', 'mass_type', 'mass_mode', 'num_steps', 'batch_size', 'learning_rate_W',
+        'dt', 'mass_type', 'mass_mode', 'integrator', 'friction', 'num_steps', 'batch_size', 'learning_rate_W',
         'eval_interval', 'eval_iters', 'eval_batch_size', 'snapshot_interval',
         'snapshot_keep_last', 'reversibility_check_interval',
         'reversibility_check_steps', 'gradient_clip_norm_W',
@@ -692,7 +703,7 @@ def load_checkpoint_ui(filepath):
     # Define the expected output components structure
     output_component_keys = [
         'data_file', 'model_type', 'embedding_dim', 'context_window', 'hidden_dim', 'n_layers',
-        'dt', 'mass_type', 'mass_mode', 'num_steps', 'batch_size', 'learning_rate_W',
+        'dt', 'mass_type', 'mass_mode', 'integrator', 'friction', 'num_steps', 'batch_size', 'learning_rate_W',
         'eval_interval', 'eval_iters', 'eval_batch_size', 'snapshot_interval',
         'snapshot_keep_last', 'reversibility_check_interval',
         'reversibility_check_steps', 'gradient_clip_norm_W',
@@ -722,8 +733,8 @@ def load_checkpoint_ui(filepath):
         print(f"Attempting to load checkpoint: {filepath}")
 
         # First, try to load the checkpoint to extract the configuration
-        import torch
-        checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
+        # weights_only loading: a checkpoint cannot run code while unpickling.
+        checkpoint = load_checkpoint_file(filepath)
 
         # Check if the checkpoint contains configuration
         if 'config' in checkpoint:
@@ -867,7 +878,7 @@ def create_ui():
                         test_split_ratio_input = gr.Slider(label="Test Split Ratio", minimum=0.01, maximum=0.5, step=0.01, value=DEFAULT_CONFIG['test_split_ratio'])
 
                         gr.Markdown("### Model Architecture")
-                        model_type_input = gr.Dropdown(label="Model Family", choices=["rnn", "transformer"], value=DEFAULT_CONFIG['model_type'], elem_classes="gr-input")
+                        model_type_input = gr.Dropdown(label="Model Family", choices=MODEL_CHOICES, value=DEFAULT_CONFIG['model_type'], elem_classes="gr-input")
                         embedding_dim_input = gr.Number(label="Embedding Dim", value=DEFAULT_CONFIG['embedding_dim'], precision=0, elem_classes="gr-input")
                         context_window_input = gr.Number(label="Context Window", value=DEFAULT_CONFIG['context_window'], precision=0, elem_classes="gr-input")
                         hidden_dim_input = gr.Number(label="Hidden Dim", value=DEFAULT_CONFIG['hidden_dim'], precision=0, elem_classes="gr-input")
@@ -879,6 +890,8 @@ def create_ui():
                         dt_input = gr.Number(label="dt (Time Step)", value=DEFAULT_CONFIG['dt'], minimum=0.0001, step=0.001, elem_classes="gr-input")
                         mass_type_input = gr.Dropdown(label="Mass Type", choices=["uniform", "frequency", "inverse_frequency"], value=DEFAULT_CONFIG['mass_type'], elem_classes="gr-input")
                         mass_mode_input = gr.Dropdown(label="Mass Mode", choices=["static", "fisher"], value=DEFAULT_CONFIG['mass_mode'], elem_classes="gr-input")
+                        integrator_input = gr.Dropdown(label="Integrator", choices=INTEGRATOR_CHOICES, value=DEFAULT_CONFIG['integrator'], info="langevin with friction > 0 = damped dynamics (default); leapfrog = undamped, never settles.", elem_classes="gr-input")
+                        friction_input = gr.Number(label="Friction (gamma)", value=DEFAULT_CONFIG['friction'], minimum=0.0, step=0.5, info="Used by the langevin integrator. 0 = conservative.", elem_classes="gr-input")
                         adaptive_dt_input = gr.Checkbox(label="Adaptive dt", value=DEFAULT_CONFIG['adaptive_dt'], info="Shrink dt when Hamiltonian drift rises.")
                         with gr.Row():
                             dt_min_input = gr.Number(label="dt Min", value=DEFAULT_CONFIG['dt_min'], minimum=0.000001, step=0.00001, elem_classes="gr-input")
@@ -914,7 +927,7 @@ def create_ui():
                 config_output_components_for_load = [
                     status_textbox,
                     data_file_input, model_type_input, embedding_dim_input, context_window_input, hidden_dim_input, n_layers_input,
-                    dt_input, mass_type_input, mass_mode_input, num_steps_input, batch_size_input, learning_rate_W_input,
+                    dt_input, mass_type_input, mass_mode_input, integrator_input, friction_input, num_steps_input, batch_size_input, learning_rate_W_input,
                     eval_interval_input, eval_iters_input, eval_batch_size_input,
                     snapshot_interval_input, snapshot_keep_last_input,
                     reversibility_interval_input, reversibility_steps_input,
@@ -949,7 +962,7 @@ def create_ui():
                 restore_defaults_components = [
                     status_textbox,
                     data_file_input, test_split_ratio_input, model_type_input, embedding_dim_input, context_window_input,
-                    hidden_dim_input, n_layers_input, dt_input, mass_type_input, mass_mode_input, num_steps_input,
+                    hidden_dim_input, n_layers_input, dt_input, mass_type_input, mass_mode_input, integrator_input, friction_input, num_steps_input,
                     batch_size_input, learning_rate_W_input, eval_interval_input,
                     eval_iters_input, eval_batch_size_input, snapshot_interval_input,
                     snapshot_keep_last_input, reversibility_interval_input,
@@ -979,6 +992,8 @@ def create_ui():
                 dt_input.change(lambda x: update_config_value('dt', x), inputs=dt_input, outputs=dt_input)
                 mass_type_input.change(lambda x: update_config_value('mass_type', x), inputs=mass_type_input, outputs=mass_type_input)
                 mass_mode_input.change(lambda x: update_config_value('mass_mode', x), inputs=mass_mode_input, outputs=mass_mode_input)
+                integrator_input.change(lambda x: update_config_value('integrator', x), inputs=integrator_input, outputs=integrator_input)
+                friction_input.change(lambda x: update_config_value('friction', x), inputs=friction_input, outputs=friction_input)
                 adaptive_dt_input.change(lambda x: update_config_value('adaptive_dt', x), inputs=adaptive_dt_input, outputs=adaptive_dt_input)
                 dt_min_input.change(lambda x: update_config_value('dt_min', x), inputs=dt_min_input, outputs=dt_min_input)
                 dt_max_input.change(lambda x: update_config_value('dt_max', x), inputs=dt_max_input, outputs=dt_max_input)
@@ -1042,9 +1057,35 @@ def create_ui():
     return demo
 
 # --- Run the App ---
+def parse_args(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="YAUM training UI")
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help=(
+            "Create a public gradio.live link. Off by default: the UI can read "
+            "server-side file paths, so only share on a machine you are happy "
+            "to expose."
+        ),
+    )
+    parser.add_argument("--server-name", default="127.0.0.1",
+                        help="Interface to bind (use 0.0.0.0 for LAN access).")
+    parser.add_argument("--server-port", type=int, default=None)
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    from yaum.core.utils import describe_device
+    print(f"Device: {describe_device()}")
     print(f"Launching Gradio UI... Default config: {APP_STATE['config']}")
     demo = create_ui()
     # Enable queue for smoother handling of multiple requests/updates
     demo.queue()
-    demo.launch(share=True) # set share=True for public link if needed
+    demo.launch(
+        share=args.share,
+        server_name=args.server_name,
+        server_port=args.server_port,
+    )

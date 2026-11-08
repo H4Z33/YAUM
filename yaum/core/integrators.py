@@ -13,7 +13,7 @@ from __future__ import annotations
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Callable, Protocol, Union
+from typing import Protocol
 
 import torch
 
@@ -36,6 +36,12 @@ class PhaseStep:
 
     ``loss_final`` may still carry an autograd graph when ``retain_final``
     is True so the caller can backprop through it to update model weights.
+
+    ``P_conservative_in`` / ``P_conservative_out`` are set by integrators
+    that wrap a conservative core with non-conservative pieces (friction,
+    noise). They are the momenta entering and leaving the core, so the
+    caller can measure the core's energy error without counting the heat
+    deliberately exchanged with the bath.
     """
 
     E: torch.Tensor
@@ -43,6 +49,8 @@ class PhaseStep:
     loss_initial: torch.Tensor
     loss_final: torch.Tensor
     n_force_evals: int
+    P_conservative_in: torch.Tensor | None = None
+    P_conservative_out: torch.Tensor | None = None
 
 
 class SymplecticIntegrator:
@@ -133,6 +141,12 @@ class LangevinIntegrator(SymplecticIntegrator):
     canonical ensemble, trading strict energy conservation for the
     ability to explore ``(E, P)`` configurations at a fixed temperature.
 
+    With ``temperature=0`` the noise vanishes and the step is pure
+    friction around a symplectic core (conformally symplectic, damped
+    dynamics): energy is conserved inside the core and removed at a rate
+    set by ``gamma``. This is the trainer's default — conservative
+    motion for coherence, dissipation so the embeddings can settle.
+
     The core defaults to leapfrog but accepts any other
     :class:`SymplecticIntegrator` — passing ``"yoshida4"`` gives
     fourth-order deterministic accuracy inside the thermostat.
@@ -145,7 +159,7 @@ class LangevinIntegrator(SymplecticIntegrator):
         self,
         friction: float = 1.0,
         temperature: float = 1.0,
-        core: Union[str, "SymplecticIntegrator"] = "leapfrog",
+        core: str | SymplecticIntegrator = "leapfrog",
     ):
         if friction < 0:
             raise ValueError("friction must be >= 0")
@@ -169,6 +183,8 @@ class LangevinIntegrator(SymplecticIntegrator):
         c = math.exp(-self.gamma * half_dt)
         variance = mass * self.kT * (1.0 - c * c)
         sigma = torch.sqrt(torch.clamp(variance, min=0.0))
+        if self.kT == 0.0:
+            return c * P
         noise = torch.randn_like(P)
         return c * P + sigma * noise
 
@@ -182,6 +198,8 @@ class LangevinIntegrator(SymplecticIntegrator):
             loss_initial=inner.loss_initial,
             loss_final=inner.loss_final,
             n_force_evals=inner.n_force_evals,
+            P_conservative_in=P_in.detach(),
+            P_conservative_out=inner.P,
         )
 
 
@@ -220,7 +238,7 @@ class MultiScaleIntegrator(SymplecticIntegrator):
 
     def __init__(
         self,
-        inner: Union[str, "SymplecticIntegrator"] = "leapfrog",
+        inner: str | SymplecticIntegrator = "leapfrog",
         n_inner: int = 4,
         slow_lambda: float = 1e-3,
     ):

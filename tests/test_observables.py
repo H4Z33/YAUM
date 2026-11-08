@@ -14,7 +14,6 @@ from yaum.core.observables import (
     snapshot,
 )
 
-
 # ---- entropy -------------------------------------------------------------
 
 def test_entropy_logdet_drops_as_rows_collapse():

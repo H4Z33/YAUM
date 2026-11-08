@@ -35,7 +35,7 @@ class HamiltonianSubstrate:
         dt: float,
         device,
         dtype: torch.dtype = torch.float32,
-    ) -> "HamiltonianSubstrate":
+    ) -> HamiltonianSubstrate:
         E = torch.randn(
             vocab_size,
             embedding_dim,
