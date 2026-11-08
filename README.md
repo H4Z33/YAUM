@@ -121,6 +121,9 @@ See [LICENSE](LICENSE).
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Before changing code, read [CLAUDE.md](CLAUDE.md) (layout, contracts,
+research hygiene) and [docs/LESSONS.md](docs/LESSONS.md) (past mistakes and
+the open backlog) — they are written for human and AI contributors alike.
 Contributions are accepted under the same PolyForm Noncommercial license.
 
 ### Contributor License Agreement (CLA)
