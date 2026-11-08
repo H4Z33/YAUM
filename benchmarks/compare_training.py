@@ -46,7 +46,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-import torch.optim as optim
+from torch import optim
 
 from yaum.core.trainer import Trainer
 from yaum.core.utils import get_batch
@@ -175,10 +175,10 @@ def run_yaum(name, train_data, test_data, windows, cfg, seed, overrides) -> RunR
 
 
 YAUM_VARIANTS = {
-    "yaum_static": dict(
-        integrator="leapfrog", mass_mode="static", adaptive_dt=False, dt=0.05
-    ),
-    "yaum_fisher": dict(integrator="leapfrog", adaptive_dt=False, dt=0.01),
+    "yaum_static": {
+        "integrator": "leapfrog", "mass_mode": "static", "adaptive_dt": False, "dt": 0.05
+    },
+    "yaum_fisher": {"integrator": "leapfrog", "adaptive_dt": False, "dt": 0.01},
     "yaum_damped": {},  # trainer defaults
 }
 

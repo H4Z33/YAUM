@@ -1,121 +1,150 @@
-# YAUM
-Yet Another Universal Model
-
-# Hamiltonian LLM Trainer
+# YAUM — Yet Another Universal Model
 
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-lightgrey.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
-**Explore Language Model Training Through the Lens of Classical Mechanics**
+**Language-model training and inference through the lens of classical mechanics.**
 
-This project provides a framework and application for training character-level language models using an approach inspired by Hamiltonian mechanics and the principle of least action. Instead of standard gradient descent on embeddings, we treat token embeddings as particles in a "Semantic Phase Space" evolving over training time according to Hamiltonian dynamics.
+YAUM is a research codebase built around one hypothesis: neural networks need
+not just data and mechanics but *rules*, and Hamiltonian mechanics — energy,
+momentum, conservation, controlled dissipation — is a good candidate for the
+rules of a model's substrate.
 
-**Key Features:**
+It explores that idea in two places:
 
-*   **Hamiltonian Dynamics:** Implements Leapfrog integration for updating token embeddings (`E`) and their corresponding momenta (`P`).
-*   **Configurable Physics:** Easily adjust timestep (`dt`), adaptive `dt` bounds, and token mass. New runs default to Fisher mass with frequency/uniform scalar mass still available.
-*   **Standard + Hamiltonian:** Combines Hamiltonian updates for embeddings with standard optimizers (Adam) for the main model weights.
-*   **Model-Agnostic Force Field:** Runs the same Hamiltonian substrate under RNN or Transformer sequence models.
-*   **Interactive UI:** A Gradio-based interface for easy configuration, data loading, training monitoring (progress, logs, plots), and text generation (inference).
-*   **Modular Structure:** Code organized into data handling, models, core dynamics, trainer logic, and UI for extensibility.
-*   **Checkpointing:** Save and load training state (model weights, embeddings, momenta, optimizer state), including periodic snapshots and phase-shift snapshots.
-*   **Dual Licensed:** Offered under both Apache 2.0 and PolyForm Noncommercial 1.0.0 licenses (see below).
+1. **Physics in training time** (`yaum/core/`). Token embeddings `E` are
+   particles with momentum `P` and mass `m`, moved by a symplectic integrator
+   with the loss as potential energy, while the network weights `W` are
+   trained with Adam.
+2. **Physics in context time** (`yaum/models/hamiltonian.py`). The model's
+   hidden state is a phase point `(q, p)` that evolves under a *learned*
+   energy function as tokens arrive: each token is an impulse, and between
+   tokens the state follows Hamiltonian flow with a learned, per-mode friction.
+   This is the "a model is a small universe that moves with context as time"
+   version of the idea.
 
-**(Placeholder for a Screenshot/GIF of the Gradio UI)**
-![UI Screenshot Placeholder](placeholder.png)
+See [`docs/ARTICLE.md`](docs/ARTICLE.md) for the reasoning and the measured
+results — including the ones that did not go the project's way.
+
+## What the measurements say so far
+
+* **Training time.** With a well-scaled mass (RMS of the force, see
+  `yaum/core/geometry.py`) and friction, symplectic updates of `E` tie a
+  *tuned* Adam on the same embeddings (held-out loss 0.170 vs 0.171, seed std
+  0.007) and clearly beat leaving `E` frozen (0.221). They do not beat Adam.
+  See `benchmarks/results.md`.
+* **Context time.** See `benchmarks/context_dynamics_results.md` and the
+  article for the LSTM-vs-Hamiltonian comparison and what friction the model
+  chooses to learn on each task.
+
+## Key features
+
+* **Symplectic integrators:** leapfrog, Yoshida 4th order, Langevin (OBABO,
+  with `temperature=0` giving pure damping), rRESPA multi-time-step.
+* **Damped dynamics by default:** a conservative leapfrog core wrapped in
+  friction, so embeddings can settle instead of oscillating forever.
+* **RMS-Fisher mass:** `m = sqrt(EMA[F²]) + ε`, giving O(1) acceleration at
+  any gradient scale.
+* **Honest energy diagnostic:** `ΔH/H` is the one-step energy error of the
+  integrator's conservative core (same batch, same weights), which drives
+  the adaptive `dt`.
+* **Model-agnostic force field:** RNN, Transformer, and the Hamiltonian
+  sequence model all plug into the same trainer.
+* **Gradio UI** for configuration, live telemetry, checkpoints and sampling.
+* **Safe checkpoints:** loaded with `weights_only=True`, so a malicious file
+  cannot run code.
 
 ## Installation
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/your-username/hamiltonian-llm-trainer.git
-    cd hamiltonian-llm-trainer
-    ```
-2.  **Create a virtual environment (recommended):**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-    ```
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(You might need to install PyTorch separately first, following instructions on the official PyTorch website: https://pytorch.org/)*
+```bash
+git clone https://github.com/H4Z33/YAUM.git
+cd YAUM
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-## How to Run
+pip install -r requirements.txt    # NVIDIA GPU (CUDA 12.4 PyTorch)
+# or
+pip install -r requirements-cpu.txt   # CPU-only Linux, macOS (incl. Apple Silicon)
+```
+
+Other CUDA versions: install PyTorch from <https://pytorch.org/get-started/locally/>
+first, then `pip install -r requirements-common.txt`.
+
+## How to run
 
 ### One-liner via uv (recommended)
 
-Both scripts auto-install [`uv`](https://github.com/astral-sh/uv) on first run,
-resolve Python 3.10+, install the dependencies in an isolated environment,
-and launch the Gradio UI.
+The scripts install [`uv`](https://github.com/astral-sh/uv) on first run,
+create a Python 3.12 environment, install dependencies (CUDA wheels if
+`nvidia-smi` is found, CPU wheels otherwise on Linux/macOS), and launch the UI.
 
 ```bash
-# Linux / macOS
-./run.sh
-
-# Windows PowerShell
-.\run.ps1
+./run.sh                # Linux / macOS
+.\run.ps1               # Windows PowerShell
 ```
-
-Any extra arguments are forwarded to `python -m yaum.ui.app`.
 
 ### Manual
 
-1.  **Ensure dependencies are installed.**
-2.  **Run the Gradio application:**
-    ```bash
-    python -m yaum.ui.app
-    ```
-3.  **Open your web browser** to the local URL provided (usually `http://127.0.0.1:7860`).
+```bash
+python -m yaum.ui.app                          # http://127.0.0.1:7860
+python -m yaum.ui.app --server-name 0.0.0.0    # reachable on your LAN
+python -m yaum.ui.app --share                  # public gradio.live link
+```
 
-## Basic Usage
+The UI is local-only by default. Only use `--share` on a machine you are
+happy to expose: the UI reads files by server-side path.
 
-1.  **Setup & Config Tab:**
-    *   Enter the path to your training text file (`.txt`).
-    *   Adjust model architecture (model family, embedding dim, hidden dim, layers), Hamiltonian parameters (`dt`, mass mode/type), snapshot cadence, and training settings (steps, batch size, learning rate).
-    *   Optionally, provide a path to a checkpoint file to load.
-    *   Click "Prepare Data & Model / Apply Config" to load data and initialize the trainer based on the current settings OR click "Load Checkpoint" to load a previous run. Check the status bar for confirmation or errors.
-2.  **Training Tab:**
-    *   Click "Start Training". The training will begin in the background.
-    *   Monitor progress via the progress bar, log output, and dynamically updating plots.
-    *   Click "Stop Training" to gracefully halt the process (saves a final checkpoint).
-3.  **Inference Tab:**
-    *   Ensure a model is ready (either trained or loaded from a checkpoint).
-    *   Enter a starting prompt.
-    *   Adjust generation length and temperature.
-    *   Click "Generate Text".
+### Benchmarks
+
+```bash
+python -m benchmarks.compare_training      # embedding update rules (training time)
+python -m benchmarks.context_dynamics      # LSTM vs Hamiltonian state (context time)
+python -m pytest -q                        # test suite
+```
+
+## Basic usage
+
+1. **Setup & Config tab:** pick a `.txt` training file; choose the model
+   family (`rnn`, `transformer`, `hamiltonian`), sizes, integrator, friction,
+   `dt` and mass mode; then click **Prepare Data & Model / Apply Config**, or
+   load a checkpoint.
+2. **Training tab:** start/stop training; watch losses, `|ΔH/H|`, `dt`,
+   momentum and the other observables.
+3. **Inference tab:** generate text with a prompt, length and temperature.
 
 ## License
 
-This project is dual-licensed:
-
-*   **PolyForm Noncommercial License 1.0.0:** You may use this software for non-commercial purposes. See [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
-*   **Commercial use requires separate licensing** 
-
-You may choose which license applies to your specific use case. Contributions are accepted under the Apache License 2.0.
+YAUM is licensed under the **PolyForm Noncommercial License 1.0.0**: you may
+use, modify and share it for non-commercial purposes. Commercial use requires
+a separate license — contact [H4Z33 on GitHub](https://github.com/H4Z33/YAUM).
+See [LICENSE](LICENSE).
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and the [CALL_FOR_COLLABORATORS.md](CALL_FOR_COLLABORATORS.md) if you're interested in joining the research effort.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are accepted under the same PolyForm Noncommercial license.
 
-## Future Directions
+### Contributor License Agreement (CLA)
 
-*   Implement subword tokenization (BPE/SentencePiece).
-*   Integrate richer model architectures and substrate couplings.
-*   Explore different potential energy (`V`) formulations incorporating grammatical rules.
-*   Add more sophisticated UI features and visualizations.
-*   Rigorous comparison against standard training baselines.
-*   Theoretical analysis of the dynamics in semantic space.
+By contributing to this project, you agree that:
 
-## Contributor License Agreement (CLA)
-
-By contributing to this project, you agree to the following:
-
-1. All contributions you make to this repository are licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
-2. You acknowledge that **you will not retain rights** to the code after contributing, and the rights to the code will remain with the project owner.
-3. You agree that **commercial use requires separate licensing**.
-4. You grant the project owner the ability to make commercial use of the code in any way, including licensing and distributing.
+1. All contributions you make are licensed under the
+   [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
+2. You **do not retain rights** to the code after contributing; the rights
+   remain with the project owner.
+3. Commercial use requires separate licensing.
+4. You grant the project owner the right to make commercial use of the code
+   in any way, including licensing and distribution.
 
 If you do not agree with the above, please do not contribute.
 
-For commercial use inquiries, please contact me on GitHub
+## Future directions
+
+* Scale the context-time model (parallel scan or chunked integration instead
+  of a Python loop over tokens) and test it on real text.
+* Symmetry-derived potentials: choose what the energy should be invariant to
+  and let conservation laws follow (Noether), rather than adding them by hand.
+* Composition/binding experiments: can stable "composite particles" (bound
+  states of the learned potential) be found and probed?
+* Wire replica exchange (`yaum/core/replica.py`, implemented and tested but
+  not yet used by the trainer) into training.
+* Subword tokenization (BPE/SentencePiece).

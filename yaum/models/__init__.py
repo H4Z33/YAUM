@@ -1,12 +1,14 @@
 """Model registry. Pick an architecture via ``config['model_type']``."""
 from __future__ import annotations
 
+from .hamiltonian import HamiltonianCharModel
 from .rnn import RNNCharModel
 from .transformer import TransformerCharModel
 
 MODELS: dict[str, type] = {
     "rnn": RNNCharModel,
     "transformer": TransformerCharModel,
+    "hamiltonian": HamiltonianCharModel,
 }
 
 
@@ -15,7 +17,9 @@ def make_model(vocab_size: int, config: dict):
 
     The model class takes ``vocab_size``, ``embedding_dim``, ``hidden_dim``
     and ``n_layers``. Transformer-specific keys (``n_heads``,
-    ``max_context``, ``dropout``) are forwarded when present.
+    ``max_context``, ``dropout``) are forwarded when present, as are the
+    Hamiltonian model's ``ham_dt``, ``ham_dissipation`` and
+    ``ham_n_potential`` (there ``n_layers`` means substeps per token).
     """
     model_type = config.get("model_type", "rnn")
     try:
@@ -39,4 +43,11 @@ def make_model(vocab_size: int, config: dict):
         )
         if "dropout" in config:
             kwargs["dropout"] = float(config["dropout"])
+    if model_type == "hamiltonian":
+        if "ham_dt" in config:
+            kwargs["dt"] = float(config["ham_dt"])
+        if "ham_dissipation" in config:
+            kwargs["dissipation"] = config["ham_dissipation"]
+        if config.get("ham_n_potential"):
+            kwargs["n_potential"] = int(config["ham_n_potential"])
     return cls(**kwargs)

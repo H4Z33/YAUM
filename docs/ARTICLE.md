@@ -1,32 +1,48 @@
 # YAUM — Training as a Physical System
 
-**Thesis.** An embedding matrix is not a bag of parameters; it is a particle
-in a high-dimensional semantic phase space. If you treat it that way — give
-it momentum, give it mass, push it around with a conservative force derived
-from the loss — then the machinery of Hamiltonian mechanics comes along for
-free. You get time-reversibility, a conserved energy you can watch, a
-natural adaptive timestep, and a thermostat for exploration. None of this
-is available to an SGD/Adam loop, which forgets everything about a step as
-soon as it is taken.
+**Thesis.** Neural networks need more than data and mechanics; they need
+*rules*. Physics has spent four centuries finding good rules for systems
+that evolve in time: energy, momentum, conservation laws, and the
+symmetries those laws come from. YAUM asks whether those rules make a
+good substrate for a model to grow in.
 
-YAUM (*Yet Another Universal Model*) is a minimal, test-driven reference
-implementation of that idea.
+A language model is more than a next-token picker. While it reads, it
+builds a small world that moves forward with each token. Word2vec showed
+that knowledge has geometry (`king − man + woman ≈ queen`); attention lets
+the parts of that world interact coherently. The bet is that there are
+more structural relationships to find — the way particles combine into
+other particles — and that giving the model's internal dynamics physical
+structure is a way to find them.
+
+This document records what has been built, what was measured, and where
+the measurements went against the original framing. It was revised in
+November 2026 after an audit found that several earlier claims were
+measurement artefacts; §6 lists what changed.
 
 ---
 
-## 1. Why another trainer?
+## 1. Two places to put the physics
 
-A standard training step looks like this:
+There are two different "times" in a language model:
 
-```
-θ ← θ − η · ∇L(θ)
-```
+| | training time | context time |
+|---|---|---|
+| clock | optimiser steps | tokens read |
+| what moves | the parameters | the hidden state |
+| YAUM component | `yaum/core/` trainer + integrators | `yaum/models/hamiltonian.py` |
 
-The system has no memory: every step starts from the same kinetic zero.
-The step size `η` is chosen once, for all parameters, and the only feedback
-the loop has about its own stability is whether the loss went down.
+YAUM started with the first: treat the embedding table `E` as particles
+with momentum and mass, moved by the gradient of the loss. That turns out
+to be a respectable *optimiser* (§3) — but an optimiser is not where "a
+small universe that moves with context" lives. The second place puts the
+physics in the forward pass itself (§4), and it is the more direct test of
+the thesis.
 
-A symplectic integrator step looks like this:
+---
+
+## 2. The core machinery
+
+A symplectic step (velocity Verlet / leapfrog):
 
 ```
 P ← P + F(E) · dt/2          # half momentum kick
@@ -34,205 +50,182 @@ E ← E + (P / m) · dt         # position drift
 P ← P + F(E_new) · dt/2      # half momentum kick
 ```
 
-The force `F = −∇L`, mass `m` (we use token frequency), momentum `P`, and
-position `E` are all first-class objects. The step is
-**time-reversible** — run it backward with `dt → −dt` and you land on
-the previous state to within `O(ε_mach)`. It is **symplectic**, meaning
-the Hamiltonian `H = T(P) + V(E)` is conserved up to a bounded oscillation
-that never drifts. This is the "turtle all the way down" property — every
-structural layer of the integrator inherits the conservation laws of the
-layers beneath it.
+For a *fixed* force field this step is time-reversible and conserves a
+"shadow" energy close to `H = T + V`, so the energy error stays bounded
+instead of drifting. YAUM provides:
 
-That gives you things a plain optimiser cannot:
+* `leapfrog`, `yoshida4` (three leapfrogs with weights `w₁, w₂, w₁`),
+  `multiscale` (rRESPA: slow L2 force around fast substeps), and
+  `langevin` (OBABO: friction + noise around any core; `temperature=0`
+  gives pure damping);
+* `HamiltonianSubstrate` — explicit `(E, P, m, dt)` state;
+* `AdaptiveStepController` — shrinks `dt` when the energy error spikes;
+* `measure_reversibility` — forward-then-backward round trip;
+* phase-transition observables (`Var(H)`, `Var(‖mean E‖)`, `τ_int`, log-det
+  entropy rate) and an action integral `S = Σ (T − V) dt`.
 
-1. **`ΔH/H` — a physical stability signal.** If the energy starts drifting
-   monotonically, your timestep is too big. No loss curve can tell you
-   that; only the Hamiltonian can.
-2. **Reversibility residuals.** Run forward `n` steps, then backward `n`
-   steps, then measure `‖E_out − E_in‖`. A symplectic scheme keeps this at
-   float-precision noise. Any divergence is a direct measurement of how
-   much the integrator is lying to you.
-3. **Thermostatted exploration.** Swap the core integrator for a Langevin
-   (OBABO) splitting and the embeddings start sampling the canonical
-   ensemble at a chosen temperature `kT`. The loss landscape becomes a
-   Boltzmann distribution the particles actually explore.
-4. **Rate-preserving adaptive dt.** Feed the drift back into a controller
-   that shrinks `dt` the moment `|ΔH/H|` spikes and grows it back after a
-   calm streak. No learning-rate schedule, no warmup — just local
-   feedback.
-5. **Turtle-composable integrators.** Yoshida's 4th-order scheme is
-   literally three leapfrogs with weights `(w₁, w₂, w₁)`. rRESPA
-   multi-time-stepping is a slow kick wrapping `n_inner` fast substeps.
-   Each layer is one class, with the same `step(E, P, dt, force_fn, mass)`
-   contract.
+### What the diagnostics can and cannot tell you
+
+During training the force field is **not fixed**: every step uses a new
+minibatch, and Adam changes the weights `W` between steps. So `H` is not
+conserved by the training trajectory, and nothing in the code should
+pretend it is.
+
+* **`|ΔH/H|`** is measured per step on the *conservative core*: same
+  batch, same `W`, same mass, before vs. after one integrator step. That
+  is a real integrator-error signal and it is what drives the adaptive
+  `dt`. (An earlier version compared `H` to its value at the first eval;
+  since `H ≈ V = loss`, that number was mostly "how much has the loss
+  fallen", and it made the controller shrink `dt` to its floor as soon as
+  the model learned.)
+* **Reversibility** is checked with `W` frozen and one batch held fixed.
+  For leapfrog it is reversible by construction, so the probe detects
+  numerical trouble (precision, nondeterministic kernels, absurd `dt`),
+  not anything about learning. It reports NaN for stochastic integrators.
+* **`Var(H)` and friends** are computed over a window of eval snapshots
+  and include the downward trend of the loss. Treat them as exploratory
+  telemetry. There is currently no evidence that they anticipate
+  grokking-style transitions.
+* **`S = Σ (T − V) dt`** is a bookkeeping integral. Because `V` changes
+  with every batch and every weight update, the training trajectory does
+  not extremise it.
 
 ---
 
-## 2. Architecture at a glance
+## 3. Physics in training time: results
+
+`benchmarks/compare_training.py` holds everything fixed except how `E` is
+updated (RNN char model, Adam on `W`, synthetic vocab-32 corpus, 600 steps,
+3 seeds, fixed held-out windows):
+
+| variant | held-out loss | ‖E−E₀‖/‖E₀‖ |
+|---|---:|---:|
+| `frozen_E` (E never updated) | 0.2206 ± 0.0073 | 0.00 |
+| `adam_E` (lr 1e-3) | 0.1978 ± 0.0049 | 0.29 |
+| `adam_E_tuned` (lr 1e-2, best of sweep) | 0.1708 ± 0.0046 | 1.88 |
+| `yaum_static` (leapfrog, mass 1) | 0.1989 ± 0.0038 | 0.33 |
+| `yaum_fisher` (leapfrog, RMS-Fisher mass) | 0.1686 ± 0.0080 | 7.61 |
+| `yaum_damped` (defaults: RMS-Fisher + friction) | 0.1699 ± 0.0065 | 2.76 |
+
+What this says:
+
+1. **Dynamics on `E` help** (every non-frozen variant beats `frozen_E`).
+2. **The mass is what matters.** With `m = 1` the force (the gradient of
+   a mean loss, ~1e-4 per coordinate) barely moves anything. With
+   `m = sqrt(EMA[F²]) + ε` the acceleration `F/m` is O(1) whatever the
+   gradient scale — the same trick that makes RMSProp/Adam work, expressed
+   as inertia. (The earlier "Fisher mass" used `m = EMA[F²]`, which was
+   ~1e-7 and sat entirely under a 1e-3 floor: in practice a constant.)
+3. **Against a tuned Adam it is a tie**, not a win: 0.1699 vs 0.1708 with
+   seed std ≈ 0.007. An untuned Adam baseline (lr 1e-3) makes YAUM look
+   0.03 better; that is a statement about the baseline, not about physics.
+4. **Undamped motion does not settle.** Without friction, `E` keeps moving
+   (7.6× its initial norm here). Friction keeps the same loss with a third
+   of the travel, which is why the defaults are damped.
+
+So in training time YAUM is a heavy-ball optimiser with an RMS
+preconditioner and a clean energy-error signal for its step size. That is
+useful and well-behaved, but it is not a new kind of model.
+
+---
+
+## 4. Physics in context time
+
+`HamiltonianCharModel` makes the hidden state itself a mechanical system.
 
 ```
-                 ┌─────────────────────────────┐
-                 │           Trainer           │
-                 │  owns W (model), E, P, m    │
-                 └──────────────┬──────────────┘
-                                │
-           ┌────────────────────┼────────────────────┐
-           ▼                    ▼                    ▼
-    make_integrator()     make_model()         make_force_fn()
-  leapfrog / yoshida4    rnn / transformer       loss → gradient
-  langevin / multiscale                          → force tensor
-           │                    │                    │
-           └──────────► step(E, P, dt, force_fn, m) ◄─┘
-                               │
-                               ▼
-                     PhaseStep(E', P', L₁, L₂)
-                               │
-                               ▼
-              ┌──── total_hamiltonian() ─── observe drift
-              ├──── measure_reversibility() ── eval-tick probe
-              └──── compute_integrity() ──── checkpoint fingerprint
+H(q, p) = Σᵢ pᵢ² / 2mᵢ + V(q)
+V(q)    = Σₖ aₖ log cosh(wₖᵀ q + bₖ) + ½ Σᵢ κᵢ qᵢ²
 ```
 
-Everything downstream of `PhaseStep` is a *passive observer*: it can read
-`(E, P, loss)` and compute a scalar, but it cannot modify the trajectory.
-The integrator is the only actor. The trainer itself is just glue: it asks
-the integrator for a step, asks the observers for reports, and logs.
+* Reading token `t` applies an impulse `p ← p + B xₜ` — tokens are forces.
+* Between tokens the state follows leapfrog steps of the flow. The force
+  `−∇V` has a closed form, so the dynamics are conservative by
+  construction.
+* `aₖ` is unconstrained (many wells and barriers are possible) and
+  `κᵢ > 0` confines the motion.
+* Each mode has a friction `γᵢ ≥ 0`, applied as `p ← p·exp(−γᵢ dt/2)` on
+  both sides of each leapfrog step. That is conformally symplectic
+  integration: exact bookkeeping for the conservative part and exponential
+  decay for the dissipative part. `dissipation="learned"` trains `γ` with
+  everything else; `"none"` forces a purely conservative model.
 
-Files worth opening, in reading order:
+The tests (`tests/test_hamiltonian_model.py`) check the physics: the force
+is the exact gradient of `V`, the frictionless flow conserves energy over
+thousands of steps and runs backwards to its start, and friction drains
+energy toward the potential's minimum.
 
-| path | what lives there |
+### Why friction is part of the design
+
+A purely Hamiltonian system preserves phase-space volume. It can carry
+information forever, but it can never *contract*: no attractors, no
+"deciding", no forgetting. Computation needs both. The physical universe
+works the same way — its microscopic laws are conservative, yet every
+structure we care about (stars, chemistry, life) forms through
+dissipation. So the refined thesis is **a conservative core for memory
+and coherence plus controlled dissipation for decisions**. Learning `γᵢ`
+per mode turns that from a slogan into a measurement.
+
+### The experiment
+
+`benchmarks/context_dynamics.py` trains each model with plain Adam and an
+ordinary `nn.Embedding` on three synthetic tasks:
+
+* `recall_first` — remember the first token across 39 distractors.
+  Needs lossless long memory.
+* `count` — track the depth of a random bracket walk. Needs exact
+  accumulation.
+* `lag` — output the token from 5 steps ago. Needs *short* memory: old
+  tokens must be forgotten.
+
+**Hypothesis, registered before the first run:** the learned `γ` stays
+near zero on `recall_first` and `count` and grows on `lag`; the
+conservative model does well on the first two and worst on `lag`.
+
+*Results: see `benchmarks/context_dynamics_results.md` (this section is updated once the first full run completes).*
+
+---
+
+## 5. Related work worth reading
+
+* Hamiltonian Neural Networks (Greydanus et al., 2019); Neural ODEs
+  (Chen et al., 2018); reversible ResNets (Gomez et al., 2017).
+* Oscillator RNNs: coRNN (Rusch & Mishra, 2021); AntisymmetricRNN
+  (Chang et al., 2019).
+* Transformers as interacting-particle systems: Lu et al. (2019);
+  Geshkovski, Letrouit, Polyanskiy & Rigollet, *A Mathematical
+  Perspective on Transformers* (2023).
+* Attention as energy minimisation: Ramsauer et al., *Hopfield Networks
+  Is All You Need* (2020).
+* Geometry and composition of representations: Poincaré embeddings
+  (Nickel & Kiela, 2017); *Toy Models of Superposition* (Elhage et al.,
+  2022); vector-symbolic / holographic reduced representations;
+  geometric deep learning (Bronstein et al.).
+
+---
+
+## 6. Corrections to earlier versions of this document
+
+| earlier claim | status |
 |---|---|
-| `yaum/core/integrators.py` | `SymplecticIntegrator`, leapfrog, yoshida4, langevin, multiscale |
-| `yaum/core/dynamics.py`    | `make_force_fn`, `total_hamiltonian`, `EnergyReport` |
-| `yaum/core/substrate.py`   | `HamiltonianSubstrate` explicit `(E, P, m, dt)` phase-state wrapper |
-| `yaum/core/adaptive.py`    | `AdaptiveStepController` — H-drift → dt feedback |
-| `yaum/core/diagnostics.py` | `measure_reversibility` — forward/backward probe |
-| `yaum/core/integrity.py`   | `CheckpointIntegrity` — physical fingerprint |
-
-New trainer runs default to the information-geometric branch: Fisher mass,
-adaptive `dt`, periodic snapshots, and phase-shift snapshots. Older checkpoints
-with scalar mass are loaded conservatively so their original phase geometry is
-not silently rewritten.
-| `yaum/core/trainer.py`     | the glue |
-| `yaum/models/*`            | RNN and Transformer, both behind the same interface |
-| `yaum/ui/app.py`           | Gradio dashboard with a 3×3 live metric grid |
-| `benchmarks/compare_training.py` | head-to-head against an Adam baseline |
+| "`ΔH/H` = 0.83 is a loud warning that dt is too large" | Wrong. It was `(L₀ − L)/L₀`, i.e. learning progress. |
+| "adaptive dt shrinks dt within a few ticks" (presented as a feature) | It shrank `dt` to its floor because the loss fell, which froze `E`. Fixed. |
+| "Fisher mass turns the flow into natural-gradient dynamics" | The old mass was a constant at its floor. The new one is an RMS (Adam-style) preconditioner, not full natural gradient. |
+| "Adam wins by 6.7 %" / "YAUM beats Adam" | Both were artefacts (a broken mass; an untuned baseline). With both sides working, it is a tie. |
+| "leapfrog and yoshida4 agree to float32 precision" | True, but only because the forces were too small to move `E` at all. |
+| "checkpoint fingerprint is sensitive to any tampering" | No: anyone can recompute three norms. It catches corruption. Security comes from `weights_only=True` loading. |
+| "None of this is available to SGD/Adam, which forgets everything" | Adam keeps momentum and second-moment state; heavy-ball with an RMS mass is close kin to it. |
 
 ---
 
-## 3. How YAUM differs from similar systems
-
-| concern | standard trainer | YAUM |
-|---|---|---|
-| embedding update | gradient step, `η · ∇L` | symplectic step, second-order in `dt` |
-| state per token | just the value | value + momentum + mass |
-| stability signal | loss curve, loss NaN | `ΔH/H`, reversibility residual |
-| exploration | dropout, random restart | Langevin thermostat (OBABO) |
-| step-size control | LR schedule, warmup | `dt` closed-loop on drift |
-| checkpoint integrity | byte hash (if any) | physical fingerprint on `(T, ‖E‖, ‖P‖)` |
-| higher order | Adam/AdamW, LAMB | Yoshida4 = three-leapfrog composition |
-| multi-scale updates | gradient accumulation | rRESPA slow/fast force split |
-| architecture swap | needs full retrain | RNN ↔ Transformer share the force-field contract |
-
-None of the YAUM pieces are "just Adam with a twist". They all fall out
-of one commitment — that `E` lives in a phase space with a Hamiltonian —
-and that commitment makes every downstream component composable without a
-single feature flag.
-
----
-
-## 4. Benchmark
-
-The script in `benchmarks/compare_training.py` runs three variants on an
-identical synthetic corpus (vocab 32, 8k tokens), pinning the model, the
-batch sequence, and the RNG. The only thing that changes between variants
-is the rule for updating `E`.
-
-Headline numbers on a 300-step run (`seed=0`):
-
-| variant | wall (s) | force evals | final train | final test | best test | peak |ΔH/H| |
-|---|---:|---:|---:|---:|---:|---:|
-| `baseline_adam` | 4.18 | 300  | 0.4984 | 0.5074 | 0.5119 | — |
-| `yaum_leapfrog` | 4.79 | 600  | 0.5333 | 0.5408 | 0.5459 | 8.34e-01 |
-| `yaum_yoshida4` | 7.63 | 1800 | 0.5333 | 0.5408 | 0.5459 | 8.34e-01 |
-
-### What this actually says
-
-1. **On raw loss, Adam wins by ~6.7 % in this regime.** That is honest and
-   expected: Adam is a very aggressive preconditioner and the synthetic
-   corpus has clean, small gradients. YAUM is not trying to out-Adam
-   Adam on loss — it is trying to make the embedding update a
-   well-defined physical process.
-
-2. **YAUM produces a signal Adam cannot.** The `|ΔH/H|` column is the peak
-   normalised drift of the Hamiltonian during the run. With `dt = 0.05`,
-   drift reaches 0.83 — a loud warning that this timestep is too large
-   for this system. Flip on `adaptive_dt=True` and the controller shrinks
-   `dt` within a few eval ticks. An Adam run has no analogous alarm.
-
-3. **Symplectic costs are modest.** Leapfrog is `1.15×` Adam wall time for
-   exactly `2×` the gradient evaluations (leapfrog uses two force calls
-   per step). Yoshida4 is `3×` force evaluations, landing at `1.59×`
-   leapfrog wall time — and on a mild-force regime like this it buys you
-   nothing, because leapfrog and yoshida4 already agree to float-32
-   precision. The dashboard makes this visible so you can switch back.
-
-4. **Reversibility is binary.** The trainer's reversibility probe
-   (`yaum/core/diagnostics.py`) is wired into the Gradio dashboard. On a
-   healthy run the residual sits at `~1e-6`; the moment you introduce
-   non-conservative state (e.g. dropout inside the force field), it
-   explodes to `O(1)` and the chart screams.
-
-### Conclusions, short version
-
-- YAUM is **not** a drop-in replacement for Adam if your only goal is
-  minimum validation loss on a tiny corpus. Use Adam.
-- YAUM **is** the right substrate if you want first-class answers to:
-  "is my timestep safe?", "is my run reversible?", "can I explore at a
-  controlled temperature?", "is my checkpoint physically coherent?" —
-  none of which an optimiser loop knows how to ask.
-- The two frameworks can **coexist**. The trainer already runs Adam on
-  the network weights `W` and symplectic dynamics on the embeddings `E`
-  in the same step. This is the "time is all it has" split: `W` gets
-  Adam, `E` lives in phase space, and the loss couples them through the
-  forward pass.
-
----
-
-## 5. Running the benchmark yourself
+## 7. Reproducing
 
 ```
-# Linux / macOS / WSL
-./installer/run.sh
-
-# Windows (cmd or Explorer)
-installer\run.bat
+python -m pytest -q
+python -m benchmarks.compare_training          # §3
+python -m benchmarks.context_dynamics          # §4
 ```
 
-Either script bootstraps `uv`, resolves Python and the pinned
-`requirements.txt`, and launches the Gradio UI. To reproduce the
-benchmark numbers above:
-
-```
-uv run --python ">=3.10" --with-requirements requirements.txt \
-    python -m benchmarks.compare_training --num-steps 300 --seed 0
-```
-
-The report is printed to stdout and appended to `benchmarks/results.md`.
-
----
-
-## 6. What to read next
-
-- `tests/test_integrators.py` — the physics lives here. Start with
-  `test_reversibility_leapfrog_within_float_noise` and
-  `test_yoshida_order_beats_leapfrog_on_stiff_oscillator`.
-- `tests/test_integrity.py` — checkpoint integrity round-trip and
-  tamper-detection specs.
-- `tests/test_trainer.py` — end-to-end trainer contract: setup,
-  generator-style training yields, Langevin + multi-scale variants,
-  Transformer model drop-in, adaptive `dt` feedback.
-
-Every feature mentioned in this article has a spec file that runs in
-under a second. If a claim here isn't visible from a test, consider it
-unsupported and open an issue.
+Every claim in this document should be visible either in a test or in one
+of the two benchmark reports. If it isn't, treat it as unsupported and
+open an issue.
