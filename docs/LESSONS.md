@@ -21,6 +21,20 @@ rewrite past entries. Newest session first.
     before launching long ones.
 16. **Physics tests don't predict learnability (again, see 0c).** All 11
     physics tests pass; the model is at chance on three of four tasks.
+17. **Measure whether the parts can see each other.** One probe (kernel
+    value between the newest particle and the rest, at init) explained
+    the many-body failure: pairs felt ~2e-5 of the interaction. Any
+    interaction with a length scale needs its initial distances checked
+    against that scale, the same lesson as #3 (magnitudes) in geometry.
+18. **Stability and memory trade off, physically.** Expansion (negative
+    κ) made gradients perfectly tame and made recall impossible;
+    primordial particles made recall possible and gradients explode.
+    Treat "calm gradients" as necessary, not as progress.
+19. **Pre-register before replicating a diagnostic.** A 3-seed diagnostic
+    gave `assoc` 0.81 with two seeds at 0.99. Registering the claim first
+    and rerunning at the benchmark's settings gave 0.57: bimodal seeds
+    plus a config difference. Without the registration step it would
+    have been reported as "beats the LSTM".
 
 ---
 
@@ -168,6 +182,17 @@ hash instead of deleting them.
       position component to the charge (a minimal clock); (c) 4–6k steps
       on `recall_first` (is it just the plateau?). Also more seeds on
       `assoc` (is seed 2's failure common?).
+      Done for (a) as a probe plus "Big Bang" options (dense birth,
+      expansion, primordial particles); see ARTICLE §4.1. (b) and (c)
+      still open.
+- [ ] Big Bang follow-ups: why is dense birth bimodal across seeds
+      (what differs in the stalled ones: σ, charge scale, spawn scale)?
+      Embedding 32 vs 16 at 5 seeds. Tame the primordial-particle
+      gradient explosions (friction on primordials, smaller dt,
+      truncated backprop) and recheck its recall signal. A schedule
+      ("inflation then cooling": expansion only for the first few
+      tokens, or friction rising with time) instead of constant κ.
+      Give the LSTM a longer budget too before comparing at more steps.
 - [ ] Stabilise dynamic geometry before judging the idea: weaker initial
       coupling (scale tanh² by a learned ε ≈ 0.1), heavier/stiffer geometry
       (slower timescale), smaller `dt`, truncated backprop, gradient-norm

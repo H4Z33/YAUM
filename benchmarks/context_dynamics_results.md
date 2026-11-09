@@ -113,3 +113,37 @@ Pre-registered hypothesis 3 is **largely not supported**: a tie with
 it (0.50, 0.55) and one stuck at chance; at chance on recall_first, count
 and lag, with γ never leaving its 0.05 start on those tasks.
 Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. Learned γ starts at 0.05.
+
+## Run steps=1500 T=40 hidden=64 (particle dim 32) substeps=2 dt=0.5 seeds=[0, 1, 2, 3, 4] lstm_forget_bias=3.0 — hypothesis 4 (dense birth)
+
+| task | model | accuracy | params | learned γ median (90th pct) | geometry γ / stiffness λ | wall (s) |
+|---|---|---:|---:|---:|---:|---:|
+| assoc | `lstm` | 0.678 ± 0.060 | 21,768 | — | — | 5 |
+| assoc | `particles` | 0.333 ± 0.175 | 2,652 | 0.067 (0.088) | — | 103 |
+| assoc | `particles_dense` | 0.571 ± 0.206 | 2,652 | 0.044 (0.054) | — | 78 |
+
+Per seed: lstm 0.714 / 0.709 / 0.643 / 0.591 / 0.735; particles 0.483 /
+0.546 / 0.127 / 0.265 / 0.243; particles_dense 0.521 / 0.929 / 0.506 /
+0.395 / 0.504 (1 of 5 seeds above 0.9).
+
+Hypothesis 4 **not supported**: dense birth is below the LSTM on average
+(0.571 vs 0.678). It is above the sparse-born particle model (0.333), a
+difference of about 2 combined standard errors: suggestive, not
+established. The particle models have ~8× fewer parameters.
+
+### Diagnostic (not a benchmark): Big Bang variants, embedding dim 32, 3 seeds
+
+Script kept outside the repo; settings as above except embedding 32;
+`recall_first` 600 steps, `assoc` 1500 steps. Gradient norm = max over
+the first 100 steps (clipped to 1.0 for the update).
+
+| variant | assoc | recall_first (600 steps) | max grad norm, recall |
+|---|---:|---:|---:|
+| base (sparse birth) | 0.281 ± 0.124 | 0.121 ± 0.008 | 2 – 279 |
+| dense (spawn 0.1) | 0.812 ± 0.307 (0.98, 0.46, 0.99) | 0.150 ± 0.012 | 121 – 46,885 |
+| dense + expansion (κ₀ = −0.02) | 0.618 ± 0.268 | 0.123 ± 0.005 | < 2 |
+| dense + 4 primordial particles | 0.516 ± 0.125 | 0.233 ± 0.120 (0.36, 0.13, 0.21) | 2,865 – 4.4e6 |
+| all three ("Big Bang") | 0.487 ± 0.014 | 0.121 ± 0.006 | < 2.1 |
+
+With expansion allowed, learned κ went *negative* on recall (−0.03,
+expanding) and back *positive* on assoc (+0.10, confining).

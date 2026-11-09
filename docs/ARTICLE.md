@@ -296,6 +296,31 @@ learning plateau seen on `assoc` is never crossed within 1500 steps of
 40-token sequences; with no positional signal, "first" and "k steps ago"
 are hard to read from drift alone.
 
+**"We need a Big Bang"** (owner, 2026-11-09). A probe confirmed the first
+explanation: at initialisation a typical pair of particles is ~3σ apart
+and feels ~2e-5 of the full interaction, so each new particle only feels
+copies of its own token, and the first token of `recall_first` is
+effectively invisible. The universe starts cold and sparse. Three
+cosmological options were added (off by default): a learned birth scale
+(dense, "hot" start), a signed confinement acting as a cosmological
+constant (expansion, distance as a clock), and learned primordial
+particles (an initial condition before any token). A 3-seed diagnostic
+(results file) showed:
+
+* **density enables binding:** `assoc` 0.81 ± 0.31 with two seeds at 0.98–0.99;
+* **expansion calms gradients but erases the past:** max gradient norm < 2
+  everywhere, yet chance on recall. The model learned to expand on
+  recall and to confine on `assoc` when allowed both;
+* **primordial particles gave the only recall signal** (best seed 0.36),
+  with the worst gradients (up to 4e6).
+
+The pre-registered 5-seed check at the benchmark's settings (embedding
+16) did **not** confirm the `assoc` win: dense birth 0.571 ± 0.206 (one
+seed 0.93) versus LSTM 0.678 ± 0.060 and sparse-born particles
+0.333 ± 0.175. Dense birth probably helps; it does not beat the LSTM,
+and its outcome is strongly seed-dependent (bimodal: a seed either finds
+the binding solution or stalls near 0.5).
+
 ---
 
 ## 5. Related work worth reading
@@ -329,6 +354,7 @@ are hard to read from drift alone.
 | "None of this is available to SGD/Adam, which forgets everything" | Adam keeps momentum and second-moment state; heavy-ball with an RMS mass is close kin to it. |
 | (first context-time run) "Hamiltonian models solve long recall where the LSTM stays at chance" | Artefact of PyTorch's LSTM forget-gate init. With forget bias 3 the LSTM solves it too, and it matches or beats the Hamiltonian models on every task. |
 | (pre-registered) "the many-body model beats single-particle models on `assoc` and is at least as good on recall/count" | Not supported: a noisy tie on `assoc` (0.39 ± 0.23), chance on recall, count and lag. |
+| (diagnostic, 3 seeds, embedding 32) "dense-born particles solve `assoc` (0.81, two seeds ≈ 0.99), above the LSTM" | Not confirmed by the pre-registered 5-seed run at embedding 16: 0.571 ± 0.206 vs LSTM 0.678. |
 
 ---
 
