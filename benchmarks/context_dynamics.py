@@ -13,6 +13,7 @@ learned energy as tokens arrive):
                        with momentum and a content-derived charge;
                        symmetric pair attraction/repulsion; readout from
                        the newest particle (yaum/models/particles.py)
+    particles_dense    the same, born dense (spawn_scale_init=0.1)
 
 All models use an ordinary ``nn.Embedding`` and plain Adam — this
 experiment is about the dynamics *inside* the forward pass, not the
@@ -56,6 +57,17 @@ It is at least as good as ``ham_learned`` on ``recall_first`` and
 ``count``, and *worse* on ``lag``, because it has no positional encoding
 and "5 steps ago" can only be read off the dynamics. Whether it reaches
 the LSTM on ``assoc`` (0.69) is left open.
+(Result: largely not supported; see ARTICLE §4.1.)
+
+Fourth pre-registered hypothesis (written 2026-11-09, after a 3-seed
+*diagnostic* with embedding dim 32 gave ``assoc`` 0.98 / 0.46 / 0.99 for
+dense birth, but before ``particles_dense`` had ever been run in this
+benchmark): ``particles_dense`` (the particle model born dense,
+``spawn_scale_init=0.1``) reaches a mean ``assoc`` accuracy above the
+LSTM's at the same settings, over 5 seeds, with both run here. Because
+the diagnostic showed a bimodal outcome, also report how many seeds
+exceed 0.9. If the mean does not exceed the LSTM's, the diagnostic was
+noise or depended on the embedding size.
 
 Run:
 
@@ -201,6 +213,13 @@ def build(name: str, args) -> Wrapped:
             charge_dim=args.charge_dim, dt=args.dt, dissipation="learned",
             gamma_init=args.gamma_init,
         )
+    elif name == "particles_dense":
+        # "Big Bang" birth: every particle starts within interaction range.
+        core = HamiltonianParticleModel(
+            N_SYMBOLS, args.embedding_dim, args.particle_dim, args.substeps,
+            charge_dim=args.charge_dim, dt=args.dt, dissipation="learned",
+            gamma_init=args.gamma_init, spawn_scale_init=0.1,
+        )
     else:
         raise ValueError(name)
     return Wrapped(core, args.embedding_dim)
@@ -319,7 +338,7 @@ def _float_or_none(text: str):
     return None if text.lower() == "none" else float(text)
 
 
-MODELS = ("lstm", "ham_conservative", "ham_learned", "ham_geometry", "particles")
+MODELS = ("lstm", "ham_conservative", "ham_learned", "ham_geometry", "particles", "particles_dense")
 
 
 def main() -> None:
