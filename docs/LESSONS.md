@@ -5,6 +5,25 @@ rewrite past entries. Newest session first.
 
 ---
 
+## Session 2026-11-09 — many-body particle model
+
+14. **Bound the strengths, floor the ranges.** The first particle draft
+    had free charges and a free interaction range. Close encounters
+    between strongly charged particles made backprop explode (1e9–1e13).
+    Unit charges times one learned scale, `σ ≥ 0.25`, and reading out the
+    force on the newest particle brought gradient norms to ~1. The
+    gradient check (CLAUDE.md rule 7) found this in minutes. The full
+    benchmark would have taken an hour to show "learns nothing".
+15. **A plateau on the easy task predicts failure on the hard one.**
+    `assoc` (9 tokens) sat flat for hundreds of steps before learning. The
+    40-token tasks get the same step budget, are ~10× slower per step, and
+    never left chance. Look at the learning curve on the shortest task
+    before launching long ones.
+16. **Physics tests don't predict learnability (again, see 0c).** All 11
+    physics tests pass; the model is at chance on three of four tasks.
+
+---
+
 ## Session 2026-11-08 — audit, fixes, context-time model
 
 ### Background
@@ -137,12 +156,18 @@ hash instead of deleting them.
 - [x] Dynamic geometry, version A (bending resets every sequence):
       `geometry="dynamic"`. Registered hypothesis **not supported**: it ties
       on `assoc` and trains badly elsewhere (exploding gradients).
-- [ ] **Many-body model** (owner's idea, ARTICLE §4.1): every token is a
-      particle with momentum; learned, content-dependent pair attraction
-      and repulsion (symmetric, Newton's third law); clusters as composite
-      objects. Pre-register: beats single-particle models on `assoc` and
-      learns γ > 0 there. Tests: total momentum and energy conserved
-      without friction, reversibility.
+- [x] **Many-body model** (owner's idea, ARTICLE §4.1):
+      `yaum/models/particles.py` (`daf5720`). Pre-registered hypothesis
+      **largely not supported**: assoc 0.39 ± 0.23 (seeds 0.50/0.55/0.13),
+      chance on recall, count and lag.
+- [ ] Diagnose the many-body failure before changing the design. Short
+      runs (100–200 steps), logging gradient norms and the distance from
+      the newest particle to its nearest neighbour in units of σ:
+      (a) spawn new particles near the centroid of the existing ones
+      (does the new particle feel anything?); (b) add a fixed age/
+      position component to the charge (a minimal clock); (c) 4–6k steps
+      on `recall_first` (is it just the plateau?). Also more seeds on
+      `assoc` (is seed 2's failure common?).
 - [ ] Stabilise dynamic geometry before judging the idea: weaker initial
       coupling (scale tanh² by a learned ε ≈ 0.1), heavier/stiffer geometry
       (slower timescale), smaller `dt`, truncated backprop, gradient-norm

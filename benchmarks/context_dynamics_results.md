@@ -92,3 +92,24 @@ Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. Learned γ st
 `ham_learned`), spikes to 1e5. The coupled matter–geometry dynamics make
 backpropagation explode, and the geometry parameters barely move from
 their initial values (γ_Φ 0.05 → 0.054, λ 1.0 → 0.98).
+
+## Run steps=1500 T=40 hidden=32 (particle dim) charge_dim=16 substeps=2 dt=0.5 seeds=[0, 1, 2] — `particles` (many-body)
+
+Four separate invocations (one per task, run in parallel on CPU, which
+inflates wall time), consolidated here.
+
+| task | model | accuracy | params | learned γ median (90th pct) | geometry γ / stiffness λ | wall (s) |
+|---|---|---:|---:|---:|---:|---:|
+| assoc | `particles` | 0.392 ± 0.231 | 2,651 | 0.064 (0.080) | — | 182 |
+| recall_first | `particles` | 0.125 ± 0.015 | 2,651 | 0.051 (0.059) | — | 2466 |
+| count | `particles` | 0.250 ± 0.029 | 2,651 | 0.049 (0.061) | — | 2245 |
+| lag | `particles` | 0.150 ± 0.018 | 2,651 | 0.055 (0.086) | — | 2222 |
+
+Per seed: assoc 0.501 / 0.548 / 0.127; recall_first 0.119 / 0.142 / 0.114;
+count 0.216 / 0.270 / 0.263; lag 0.129 / 0.160 / 0.162.
+
+Pre-registered hypothesis 3 is **largely not supported**: a tie with
+`ham_learned` on assoc within (large) seed noise, two seeds clearly above
+it (0.50, 0.55) and one stuck at chance; at chance on recall_first, count
+and lag, with γ never leaving its 0.05 start on those tasks.
+Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. Learned γ starts at 0.05.

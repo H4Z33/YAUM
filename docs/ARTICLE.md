@@ -245,7 +245,7 @@ a fair baseline (see below). Parameters: LSTM 21.8k, Hamiltonian models
 counts, and a Hamiltonian model about 10× slower per step (Python loop
 over tokens).
 
-### 4.1 Next: a many-body universe
+### 4.1 A many-body universe
 
 Instead of one particle in a (possibly bending) landscape, every token
 becomes a particle that stays in the system, with its own position and
@@ -263,6 +263,38 @@ attention, the forces are symmetric (Newton's third law, so total momentum
 is conserved), second-order (particles carry momentum), and derived from
 one total energy. The open question is whether a conservative,
 momentum-carrying, symmetric interaction can do what attention does.
+
+**Built and measured** (`yaum/models/particles.py`, 2026-11-09). The
+interaction is φᵢⱼ = −(cᵢ·cⱼ)·exp(−|qᵢ−qⱼ|²/2σ²) with content-derived
+charges, confinement U = ½κ|q|², learned per-dimension friction, and a
+readout from the newest particle (position, velocity and the force it
+feels). Physics tests pass: momentum and energy conservation, float64
+reversibility, like charges bind, opposite charges repel, bounded energy.
+
+The first draft was untrainable (gradient norms 1e9–1e13 on 40-token
+sequences: close-encounter chaos). Unit-direction charges with one learned
+strength, a floor on σ, and the force readout brought gradients to ~1.
+
+Pre-registered: beats `ham_learned` on `assoc` by more than noise, learns
+γ > 0.05 there, ≥ `ham_learned` on recall and count, worse on lag.
+Result (particle dim 32, 3 seeds, 1500 steps):
+
+| task | particles | per seed | `ham_learned` | LSTM |
+|---|---:|---|---:|---:|
+| `assoc` | 0.392 ± 0.231 | 0.50, 0.55, 0.13 | 0.399 | **0.688** |
+| `recall_first` | 0.125 ± 0.015 | 0.12, 0.14, 0.11 | **1.000** | **1.000** |
+| `count` | 0.250 ± 0.029 | 0.22, 0.27, 0.26 | **1.000** | **1.000** |
+| `lag` | 0.150 ± 0.018 | 0.13, 0.16, 0.16 | 0.996 | **1.000** |
+
+**Largely not supported.** On `assoc` two seeds are the best any
+Hamiltonian model has scored (0.50, 0.55) and γ rose slightly (0.064),
+but one seed never left chance, so the mean is a tie. On the three
+40-token tasks it stays at chance and γ never moves. Unverified
+explanations, each with a cheap test in the backlog: new particles land
+outside the interaction range of the old ones and feel nothing; the
+learning plateau seen on `assoc` is never crossed within 1500 steps of
+40-token sequences; with no positional signal, "first" and "k steps ago"
+are hard to read from drift alone.
 
 ---
 
@@ -296,6 +328,7 @@ momentum-carrying, symmetric interaction can do what attention does.
 | "checkpoint fingerprint is sensitive to any tampering" | No: anyone can recompute three norms. It catches corruption. Security comes from `weights_only=True` loading. |
 | "None of this is available to SGD/Adam, which forgets everything" | Adam keeps momentum and second-moment state; heavy-ball with an RMS mass is close kin to it. |
 | (first context-time run) "Hamiltonian models solve long recall where the LSTM stays at chance" | Artefact of PyTorch's LSTM forget-gate init. With forget bias 3 the LSTM solves it too, and it matches or beats the Hamiltonian models on every task. |
+| (pre-registered) "the many-body model beats single-particle models on `assoc` and is at least as good on recall/count" | Not supported: a noisy tie on `assoc` (0.39 ± 0.23), chance on recall, count and lag. |
 
 ---
 

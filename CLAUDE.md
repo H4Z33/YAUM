@@ -20,7 +20,7 @@ The physics lives in two places, and keeping them apart is essential:
 | clock | optimiser steps | tokens read |
 | what moves | embedding table `E` (with momentum `P`, mass `m`) | hidden state `(q, p)` |
 | code | `yaum/core/` (trainer, integrators) | `yaum/models/hamiltonian.py` |
-| status | works; ties a tuned Adam on `E` | learns memory, learned friction is informative; a fair LSTM still matches or beats it |
+| status | works; ties a tuned Adam on `E` | learns memory, learned friction is informative; a fair LSTM still matches or beats it; many-body model trains but mostly fails (ARTICLE §4.1) |
 
 The owner's thesis is mostly about **context time** ("a model builds a
 small universe that moves with context as time"). Training-time physics
@@ -40,7 +40,7 @@ yaum/core/observables.py   Var(H), Var(|mean E|), τ_int, entropy rate (explorat
 yaum/core/action.py        S = Σ (T − V) dt (bookkeeping only)
 yaum/core/integrity.py     checkpoint corruption check (NOT security)
 yaum/core/replica.py       parallel tempering primitives (tested, NOT wired into trainer)
-yaum/models/               rnn, transformer, hamiltonian — shared interface, registry in __init__
+yaum/models/               rnn, transformer, hamiltonian, particles (many-body) — shared interface, registry in __init__
 yaum/ui/app.py             Gradio UI (global APP_STATE, background training thread)
 benchmarks/compare_training.py   training-time comparison → results.md
 benchmarks/context_dynamics.py   context-time comparison → context_dynamics_results.md
