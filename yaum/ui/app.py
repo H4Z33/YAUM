@@ -21,7 +21,7 @@ except ImportError as e:
      print("Please ensure the script is run from the project root directory (e.g., using 'python -m yaum.ui.app') or the PYTHONPATH is set correctly.")
      sys.exit(1)
 
-MODEL_CHOICES = ["rnn", "transformer", "hamiltonian"]
+MODEL_CHOICES = ["rnn", "transformer", "hamiltonian", "particles"]
 INTEGRATOR_CHOICES = ["langevin", "leapfrog", "yoshida4", "multiscale"]
 
 # --- Global State ---

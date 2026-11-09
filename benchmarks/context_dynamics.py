@@ -9,6 +9,10 @@ learned energy as tokens arrive):
     ham_geometry       ham_learned + dynamic geometry: the landscape is
                        bent by the content as it is read (joint
                        matter/geometry Hamiltonian; resets every sequence)
+    particles          many-body universe: every token becomes a particle
+                       with momentum and a content-derived charge;
+                       symmetric pair attraction/repulsion; readout from
+                       the newest particle (yaum/models/particles.py)
 
 All models use an ordinary ``nn.Embedding`` and plain Adam — this
 experiment is about the dynamics *inside* the forward pass, not the
@@ -44,6 +48,15 @@ ties it (within noise) on ``recall_first``, ``count`` and ``lag``. If
 the dynamic geometry does not help on ``assoc``, "content must bend the
 landscape" is not supported by this implementation.
 
+Third pre-registered hypothesis (written 2026-11-09, before
+``particles`` had ever been run on any task): ``particles`` beats
+``ham_learned`` on ``assoc`` by more than seed noise and learns matter
+friction above its 0.05 start there (binding needs clusters to settle).
+It is at least as good as ``ham_learned`` on ``recall_first`` and
+``count``, and *worse* on ``lag``, because it has no positional encoding
+and "5 steps ago" can only be read off the dynamics. Whether it reaches
+the LSTM on ``assoc`` (0.69) is left open.
+
 Run:
 
     python -m benchmarks.context_dynamics
@@ -63,6 +76,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from yaum.models.hamiltonian import HamiltonianCharModel
+from yaum.models.particles import HamiltonianParticleModel
 from yaum.models.rnn import RNNCharModel
 
 N_SYMBOLS = 8
@@ -181,6 +195,12 @@ def build(name: str, args) -> Wrapped:
             dt=args.dt, dissipation="learned", gamma_init=args.gamma_init,
             geometry="dynamic" if name == "ham_geometry" else "static",
         )
+    elif name == "particles":
+        core = HamiltonianParticleModel(
+            N_SYMBOLS, args.embedding_dim, args.particle_dim, args.substeps,
+            charge_dim=args.charge_dim, dt=args.dt, dissipation="learned",
+            gamma_init=args.gamma_init,
+        )
     else:
         raise ValueError(name)
     return Wrapped(core, args.embedding_dim)
@@ -241,7 +261,7 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
         wall_s=wall,
     )
     core = model.core
-    if isinstance(core, HamiltonianCharModel) and core.dissipation == "learned":
+    if isinstance(core, (HamiltonianCharModel, HamiltonianParticleModel)) and core.dissipation == "learned":
         # Matter friction only; geometry friction is reported separately.
         g = core.gamma.detach()
         result.gamma_median = float(g.median())
@@ -299,7 +319,7 @@ def _float_or_none(text: str):
     return None if text.lower() == "none" else float(text)
 
 
-MODELS = ("lstm", "ham_conservative", "ham_learned", "ham_geometry")
+MODELS = ("lstm", "ham_conservative", "ham_learned", "ham_geometry", "particles")
 
 
 def main() -> None:
@@ -313,9 +333,12 @@ def main() -> None:
     parser.add_argument("--substeps", type=int, default=2)
     parser.add_argument("--dt", type=float, default=0.5)
     parser.add_argument("--gamma-init", type=float, default=0.05)
+    parser.add_argument("--particle-dim", type=int, default=32,
+                        help="position/momentum dimension per particle")
+    parser.add_argument("--charge-dim", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument(
-        "--lstm-forget-bias", type=_float_or_none, default=1.0,
+        "--lstm-forget-bias", type=_float_or_none, default=3.0,
         help="LSTM forget-gate bias init (runs before 2026-11-08 evening used "
              "PyTorch's default, equivalent to --lstm-forget-bias none).",
     )

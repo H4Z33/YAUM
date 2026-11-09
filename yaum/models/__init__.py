@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .hamiltonian import HamiltonianCharModel
+from .particles import HamiltonianParticleModel
 from .rnn import RNNCharModel
 from .transformer import TransformerCharModel
 
@@ -9,6 +10,7 @@ MODELS: dict[str, type] = {
     "rnn": RNNCharModel,
     "transformer": TransformerCharModel,
     "hamiltonian": HamiltonianCharModel,
+    "particles": HamiltonianParticleModel,
 }
 
 
@@ -43,6 +45,13 @@ def make_model(vocab_size: int, config: dict):
         )
         if "dropout" in config:
             kwargs["dropout"] = float(config["dropout"])
+    if model_type == "particles":
+        if "ham_dt" in config:
+            kwargs["dt"] = float(config["ham_dt"])
+        if "ham_dissipation" in config:
+            kwargs["dissipation"] = config["ham_dissipation"]
+        if config.get("particle_charge_dim"):
+            kwargs["charge_dim"] = int(config["particle_charge_dim"])
     if model_type == "hamiltonian":
         if "ham_dt" in config:
             kwargs["dt"] = float(config["ham_dt"])
