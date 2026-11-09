@@ -140,3 +140,59 @@ def test_registry_and_rejects_negative_dissipation():
     assert isinstance(model, HamiltonianParticleModel) and model.charge_dim == 5
     with pytest.raises(ValueError):
         _model(-1.0)
+
+
+# ---- Big Bang options ------------------------------------------------------
+
+def test_defaults_keep_the_measured_model():
+    model = _model()
+    assert float(model.spawn_scale) == pytest.approx(1.0, rel=1e-5)
+    assert float(model.kappa) > 0 and not model.expansion
+    q, _, _ = model.init_hidden(2)
+    assert q.shape[1] == 0
+
+
+def test_dense_birth_puts_particles_within_range():
+    torch.manual_seed(0)
+    kw = {"vocab_size": 7, "embedding_dim": 16, "hidden_dim": 16, "charge_dim": 3}
+    x = torch.randn(1, 30, 16)
+    sparse = HamiltonianParticleModel(**kw)
+    dense = HamiltonianParticleModel(**kw, spawn_scale_init=0.1)
+    dense.load_state_dict({**sparse.state_dict(), "_spawn_scale": dense._spawn_scale.data})
+
+    def mean_kernel(m):
+        q = m.spawn_scale * m.to_position(x)
+        r2 = ((q.unsqueeze(2) - q.unsqueeze(1)) ** 2).sum(-1)
+        return float(torch.exp(-r2 / (2 * m.sigma**2)).mean())
+
+    with torch.no_grad():
+        assert mean_kernel(dense) > 0.5 > mean_kernel(sparse)
+
+
+def test_expansion_allows_negative_kappa_and_conserves_energy():
+    model = _model("none", dt=0.05, expansion=True, kappa_init=-0.05)
+    assert float(model.kappa) == pytest.approx(-0.05, rel=1e-4)
+    q, p, c = _universe(model, spread=0.5)
+    q = q.requires_grad_(True)
+    (grad,) = torch.autograd.grad(model.energy(q, p, c).sum(), q)
+    assert torch.allclose(model.forces(q, c), -grad, atol=1e-5)
+    with torch.no_grad():
+        H0 = model.energy(q, p, c)
+        q1, p1 = model.flow(q, p, c, 200)
+        assert float(((model.energy(q1, p1, c) - H0).abs() / H0.abs()).max()) < 1e-2
+        # A cosmological constant pushes the universe apart.
+        assert float(q1.norm(dim=-1).mean()) > float(q.norm(dim=-1).mean())
+    with pytest.raises(ValueError):
+        _model(expansion=True, kappa_init=0.5)
+
+
+def test_primordial_particles_are_learned_initial_condition():
+    model = _model(n_primordial=3)
+    q, _, c = model.init_hidden(2)
+    assert q.shape == (2, 3, 4) and c.shape == (2, 3, 3)
+    logits, (q1, _, _) = model(torch.randn(2, 4, 5), None)
+    assert q1.shape[1] == 7
+    logits.sum().backward()
+    for name in ("primordial_q", "primordial_c", "_spawn_scale"):
+        grad = getattr(model, name).grad
+        assert grad is not None and float(grad.abs().sum()) > 0, name

@@ -46,6 +46,24 @@ testable limitation.
 Cost: O(N²) per force evaluation for N particles, so O(T³) per sequence.
 Fine for the short synthetic tasks, not for long text.
 
+Big Bang options (all off by default, so the default model is the one
+measured in ARTICLE §4.1):
+
+* ``spawn_scale_init``: a learned scale ``s_q`` on the birth position,
+  ``q = s_q · A xₜ``. At the default 1.0, a typical pair is ~3σ apart at
+  initialisation and feels ~2e-5 of the full interaction: new particles
+  only feel copies of themselves (the same token, born at the same point),
+  so nothing can form. A small value (e.g. 0.1) is the hot, dense early
+  universe: every particle is born within interaction range of the others.
+* ``expansion=True``: the confinement becomes signed, ``κ ∈ (−κ_max,
+  κ_max)``. ``κ < 0`` is a cosmological constant (de Sitter-like
+  expansion): distances from the origin grow roughly like ``exp(√(|κ|/m) t)``
+  and encode age, a clock without a positional encoding. With ``κ < 0``
+  the energy is no longer bounded below; friction and the finite sequence
+  keep it in check. Watch gradient norms.
+* ``n_primordial``: K learned particles (position, momentum, charge)
+  present before the first token, the universe's initial condition.
+
 ``hidden`` is ``(q, p, c)`` for the particles already in the system,
 each shaped ``(B, N, ·)``. ``init_hidden`` returns an empty universe
 (N = 0). Passing a non-empty one continues an existing universe, which is
@@ -81,6 +99,10 @@ class HamiltonianParticleModel(nn.Module):
         charge_scale_init: float = 1.0,
         sigma_min: float = 0.25,
         readout_force: bool = True,
+        spawn_scale_init: float = 1.0,
+        expansion: bool = False,
+        kappa_max: float = 0.2,
+        n_primordial: int = 0,
     ):
         super().__init__()
         if n_layers < 1:
@@ -98,7 +120,23 @@ class HamiltonianParticleModel(nn.Module):
         self.to_charge = nn.Linear(embedding_dim, charge_dim)
 
         self._mass = nn.Parameter(torch.full((hidden_dim,), _inv_softplus(1.0)))
-        self._kappa = nn.Parameter(torch.tensor(_inv_softplus(kappa_init)))
+        self.expansion = bool(expansion)
+        self.kappa_max = float(kappa_max)
+        if self.expansion:
+            if not -kappa_max < kappa_init < kappa_max:
+                raise ValueError("with expansion, kappa_init must lie in (-kappa_max, kappa_max)")
+            self._kappa = nn.Parameter(torch.tensor(math.atanh(kappa_init / kappa_max)))
+        else:
+            self._kappa = nn.Parameter(torch.tensor(_inv_softplus(kappa_init)))
+        if spawn_scale_init <= 0:
+            raise ValueError("spawn_scale_init must be > 0")
+        self._spawn_scale = nn.Parameter(torch.tensor(_inv_softplus(spawn_scale_init)))
+        self.n_primordial = int(n_primordial)
+        if self.n_primordial > 0:
+            k = self.n_primordial
+            self.primordial_q = nn.Parameter(torch.randn(k, hidden_dim) * 0.1 * spawn_scale_init)
+            self.primordial_p = nn.Parameter(torch.zeros(k, hidden_dim))
+            self.primordial_c = nn.Parameter(torch.randn(k, charge_dim))
         self.sigma_min = float(sigma_min)
         self._sigma = nn.Parameter(torch.tensor(_inv_softplus(max(sigma_init - sigma_min, 1e-3))))
         self._charge_scale = nn.Parameter(torch.tensor(_inv_softplus(charge_scale_init)))
@@ -128,7 +166,14 @@ class HamiltonianParticleModel(nn.Module):
 
     @property
     def kappa(self) -> torch.Tensor:
+        """Confinement stiffness; negative only with ``expansion=True``."""
+        if self.expansion:
+            return self.kappa_max * torch.tanh(self._kappa)
         return F.softplus(self._kappa)
+
+    @property
+    def spawn_scale(self) -> torch.Tensor:
+        return F.softplus(self._spawn_scale)
 
     @property
     def sigma(self) -> torch.Tensor:
@@ -208,7 +253,7 @@ class HamiltonianParticleModel(nn.Module):
         if hidden is None:
             hidden = self.init_hidden(batch)
         q, p, c = hidden
-        new_q = self.to_position(embedded)
+        new_q = self.spawn_scale * self.to_position(embedded)
         new_p = self.to_momentum(embedded)
         new_c = self.charges(embedded)
         outputs = []
@@ -229,7 +274,15 @@ class HamiltonianParticleModel(nn.Module):
         return logits, (q, p, c)
 
     def init_hidden(self, batch_size: int):
+        """Empty universe, or the learned primordial particles if any."""
         ref = self._mass
+        if self.n_primordial > 0:
+            c0 = self.charge_scale * F.normalize(self.primordial_c, dim=-1)
+            return (
+                self.primordial_q.unsqueeze(0).expand(batch_size, -1, -1),
+                self.primordial_p.unsqueeze(0).expand(batch_size, -1, -1),
+                c0.unsqueeze(0).expand(batch_size, -1, -1),
+            )
         return (
             ref.new_zeros(batch_size, 0, self.hidden_dim),
             ref.new_zeros(batch_size, 0, self.hidden_dim),
