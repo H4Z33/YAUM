@@ -320,6 +320,13 @@ class HamiltonianCharModel(nn.Module):
         if self.cyclic_charge is not None:
             charge = torch.sigmoid(self.cyclic_charge(embedded))  # (B, T, 1)
             kicks = kicks * (self._active + (1.0 - self._active) * charge)
+        # Mean squared impulse on the conserved coordinates in this call: a
+        # training loop may add it to the loss as a "write cost", so that
+        # only tokens that must be remembered pay to change the conserved
+        # momenta. ``None`` when there are no cyclic coordinates.
+        self.last_cyclic_write = (
+            kicks[..., -self.n_cyclic:].pow(2).mean() if self.n_cyclic else None
+        )
         outputs = []
         for t in range(seq_len):
             p = p + kicks[:, t]

@@ -138,6 +138,21 @@ does not saturate for distractors (training at ≤ 40 tokens gives little
 pressure to), the fallback condition is training lengths 20–100; report
 both, and report the learned charges per token class.
 
+(Result: not supported. The charge changed nothing (0.145 at T = 400).
+``benchmarks/diagnostics/readout_swap.py`` shows the conserved part alone
+derails the readout, and that the charge never learned to close:
+distractor charges end anywhere from 0.01 to 0.98, because a small leak
+costs nothing at the trained lengths.)
+
+Eighth pre-registered hypothesis (written 2026-11-10, before any run with
+a write cost). Add ``λ ·`` (mean squared impulse on the conserved
+coordinates) to the loss (``--cyclic-write-cost λ``): the first token
+pays once, distractors would pay 39 times, so their writes should go to
+zero. Same criteria as hypothesis 7, ``recall_first``, trained on 20–40,
+5 seeds, own readout, for ``ham_charge`` and ``ham_cyclic_learned`` at
+λ = 0.1 and λ = 1.0 (both declared here; report both): accuracy ≥ 0.9 at
+T = 400 and at least the LSTM's at T = 1000 (0.875 ± 0.084).
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now
@@ -364,6 +379,9 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
             length = int(torch.randint(args.train_len_min, top + 1, (1,), generator=gen))
         x, y, mask = make(args.batch_size, length, gen)
         loss, _ = masked_loss_acc(model(x), y, mask)
+        write = getattr(model.core, "last_cyclic_write", None)
+        if args.cyclic_write_cost and write is not None:
+            loss = loss + args.cyclic_write_cost * write
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -424,7 +442,8 @@ def report(results: list[Result], args) -> str:
             f"\n## Run steps={args.steps} T={args.seq_len} hidden={args.hidden_dim} "
             f"substeps={args.substeps} dt={args.dt} seeds={list(args.seeds)} "
             f"lstm_forget_bias={args.lstm_forget_bias}"
-            + (f" train_len={args.train_len_min}-{args.train_len_max or args.seq_len}" if args.train_len_min else "") + "\n"
+            + (f" train_len={args.train_len_min}-{args.train_len_max or args.seq_len}" if args.train_len_min else "")
+            + (f" cyclic_write_cost={args.cyclic_write_cost}" if args.cyclic_write_cost else "") + "\n"
         ),
         ("| task | model | accuracy | params | learned γ median (90th pct) "
         "| geometry γ / stiffness λ | wall (s) |"),
@@ -534,6 +553,8 @@ def main() -> None:
                         help="cyclic (symmetry-protected) coordinates in ham_cyclic*")
     parser.add_argument("--train-len-min", type=int, default=0,
                         help="if > 0, draw each training batch's length from [this, --seq-len]")
+    parser.add_argument("--cyclic-write-cost", type=float, default=0.0,
+                        help="weight of the mean squared impulse on conserved coordinates in the loss")
     parser.add_argument("--train-len-max", type=int, default=0,
                         help="upper end of the training-length range (default: --seq-len)")
     parser.add_argument("--eval-every", type=int, default=0,

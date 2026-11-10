@@ -255,7 +255,7 @@ def test_cyclic_momenta_are_exactly_conserved_and_default_is_unchanged():
     assert torch.allclose(model.grad_potential(q), grad, atol=1e-5)
     assert float(grad[:, -3:].abs().max()) == 0.0  # V ignores cyclic coordinates
     with torch.no_grad():
-        q1, p1 = model.flow(q, p, 500)
+        _, p1 = model.flow(q, p, 500)
     # Translation symmetry → conserved momentum, even with friction elsewhere.
     assert torch.equal(p1[:, -3:], p[:, -3:])
     assert not torch.allclose(p1[:, :-3], p[:, :-3], atol=1e-2)
