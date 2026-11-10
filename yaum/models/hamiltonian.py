@@ -108,6 +108,7 @@ class HamiltonianCharModel(nn.Module):
         geometry: str = "static",
         stiffness_init: float = 1.0,
         geometry_mass_init: float = 1.0,
+        n_cyclic: int = 0,
     ):
         super().__init__()
         if n_layers < 1:
@@ -125,6 +126,23 @@ class HamiltonianCharModel(nn.Module):
         self.a = nn.Parameter(torch.randn(k) * 0.5)
         self._kappa = nn.Parameter(torch.full((hidden_dim,), _inv_softplus(0.5)))
         self._mass = nn.Parameter(torch.full((hidden_dim,), _inv_softplus(1.0)))
+
+        # Cyclic coordinates (Noether): the last ``n_cyclic`` coordinates do
+        # not appear in V at all (no wells, no confinement) and feel no
+        # friction. H is then invariant under translations along them, so
+        # their momenta are *exactly* conserved between tokens: a memory
+        # that neither oscillates nor decays. Their positions drift
+        # linearly and are not observables, so the readout sees only their
+        # velocities. Without this every mode has κ > 0 and oscillates, so
+        # a stored token is a rotating phase the readout can only decode at
+        # the trained length (ARTICLE §4.2).
+        if not 0 <= n_cyclic < hidden_dim:
+            raise ValueError("n_cyclic must be in [0, hidden_dim)")
+        self.n_cyclic = int(n_cyclic)
+        active = torch.ones(hidden_dim)
+        if self.n_cyclic:
+            active[-self.n_cyclic:] = 0.0
+        self.register_buffer("_active", active, persistent=False)
 
         self.impulse = nn.Linear(embedding_dim, hidden_dim, bias=False)
 
@@ -167,15 +185,20 @@ class HamiltonianCharModel(nn.Module):
 
     @property
     def kappa(self) -> torch.Tensor:
-        return F.softplus(self._kappa)
+        return F.softplus(self._kappa) * self._active
+
+    @property
+    def W_active(self) -> torch.Tensor:
+        """``W`` with the cyclic columns zeroed, so V ignores those coordinates."""
+        return self.W * self._active if self.n_cyclic else self.W
 
     @property
     def gamma(self) -> torch.Tensor:
         if self._rho is not None:
-            return F.softplus(self._rho)
+            return F.softplus(self._rho) * self._active
         return torch.full(
             (self.hidden_dim,), self._fixed_gamma, device=self.W.device, dtype=self.W.dtype
-        )
+        ) * self._active
 
     @property
     def stiffness(self) -> torch.Tensor:
@@ -200,23 +223,23 @@ class HamiltonianCharModel(nn.Module):
 
     def potential(self, q: torch.Tensor, phi: torch.Tensor | None = None) -> torch.Tensor:
         """``V(q; φ)``; ``phi=None`` is the trained (flat, unbent) landscape."""
-        z = q @ self.W.t() + self.b
+        z = q @ self.W_active.t() + self.b
         V = (self._logcosh(z) * self.a).sum(-1) + 0.5 * (self.kappa * q * q).sum(-1)
         if phi is not None:
             V = V + (torch.tanh(z).pow(2) * phi).sum(-1)
         return V
 
     def grad_potential(self, q: torch.Tensor, phi: torch.Tensor | None = None) -> torch.Tensor:
-        z = q @ self.W.t() + self.b
+        z = q @ self.W_active.t() + self.b
         t = torch.tanh(z)
         coeff = t * self.a
         if phi is not None:
             coeff = coeff + 2.0 * t * (1.0 - t * t) * phi
-        return coeff @ self.W + self.kappa * q
+        return coeff @ self.W_active + self.kappa * q
 
     def geometry_force(self, q: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
         """``−∂H/∂φ``: matter lowers the energy where it is; stiffness flattens."""
-        z = q @ self.W.t() + self.b
+        z = q @ self.W_active.t() + self.b
         return -torch.tanh(z).pow(2) - self.stiffness * phi
 
     def energy(self, q, p, phi=None, pi=None) -> torch.Tensor:
@@ -291,7 +314,7 @@ class HamiltonianCharModel(nn.Module):
                 q, p = self.flow(q, p, self.n_substeps)
             # The readout sees only the matter: the geometry acts on the
             # prediction solely by changing how the matter moves.
-            outputs.append(torch.cat([q, p / self.mass], dim=-1))
+            outputs.append(torch.cat([q * self._active, p / self.mass], dim=-1))
         states = torch.stack(outputs, dim=1)
         logits = self.fc(self.readout_norm(states))
         return logits, ((q, p, phi, pi) if dynamic else (q, p))

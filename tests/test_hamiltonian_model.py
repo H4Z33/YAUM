@@ -242,3 +242,26 @@ def test_static_geometry_is_unchanged_by_default():
     assert len(_model().init_hidden(2)) == 2
     with pytest.raises(ValueError):
         _model(geometry="curved")
+
+
+# ---- cyclic coordinates (Noether) -----------------------------------------
+
+def test_cyclic_momenta_are_exactly_conserved_and_default_is_unchanged():
+    torch.manual_seed(0)
+    model = HamiltonianCharModel(7, 5, 8, 2, dissipation="learned", n_cyclic=3)
+    q, p = torch.randn(4, 8), torch.randn(4, 8)
+    qg = q.clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(model.potential(qg).sum(), qg)
+    assert torch.allclose(model.grad_potential(q), grad, atol=1e-5)
+    assert float(grad[:, -3:].abs().max()) == 0.0  # V ignores cyclic coordinates
+    with torch.no_grad():
+        q1, p1 = model.flow(q, p, 500)
+    # Translation symmetry → conserved momentum, even with friction elsewhere.
+    assert torch.equal(p1[:, -3:], p[:, -3:])
+    assert not torch.allclose(p1[:, :-3], p[:, :-3], atol=1e-2)
+    logits, _ = model(torch.randn(2, 6, 5), None)
+    assert logits.shape == (2, 6, 7)
+    plain = HamiltonianCharModel(7, 5, 8, 2)
+    assert plain.n_cyclic == 0 and bool((plain.kappa > 0).all())
+    with pytest.raises(ValueError):
+        HamiltonianCharModel(7, 5, 8, 2, n_cyclic=8)

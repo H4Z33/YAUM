@@ -7,6 +7,9 @@ learned energy as tokens arrive):
     ham_conservative   friction γ = 0: a purely Hamiltonian model
     transformer        2 layers, 2 heads, sinusoidal positions (the
                        mechanism the particle model is compared to)
+    ham_cyclic         ham_conservative with 16 cyclic coordinates whose
+                       momenta are exactly conserved (Noether);
+                       ham_cyclic_learned adds learned friction elsewhere
     ham_learned        per-mode friction γ_i learned with the weights
     ham_geometry       ham_learned + dynamic geometry: the landscape is
                        bent by the content as it is read (joint
@@ -90,6 +93,32 @@ No prediction is made for the LSTM versus the transformer. If the
 conservative model degrades as fast as the LSTM, "conservation gives
 length-robust memory" is not supported by this implementation (chaos in
 the learned potential would be the first suspect).
+
+(Result: not supported. ``ham_conservative`` is at chance by T = 100.)
+
+Sixth pre-registered hypothesis (written 2026-11-10, before any model
+with cyclic coordinates had been trained). The failure above has a
+specific cause (``benchmarks/diagnostics/memory_probe.py``): every mode
+has a restoring force, so the stored token is a *rotating* phase. At
+T = 44 the trained readout scores 0.000 while a freshly fitted linear
+readout scores 1.000. Noether's theorem names the cure: make H invariant
+under translation of some coordinates and their momenta are exactly
+conserved, a memory that does not rotate. ``ham_cyclic`` is
+``ham_conservative`` with 16 of its 64 coordinates cyclic;
+``ham_cyclic_learned`` is ``ham_learned`` with the same. Prediction, on
+``recall_first``, 5 seeds, own readout (no probe):
+
+* trained at T = 40, ``ham_cyclic`` scores ≥ 0.9 at T = 400 (where
+  ``ham_conservative`` scored 0.127) and at least matches the LSTM there
+  (0.865 ± 0.168);
+* if it does not (the model may still prefer its rotating modes, which
+  work equally well at one fixed length), then with training lengths
+  drawn from 20–40 (``--train-len-min 20``) ``ham_cyclic`` reaches ≥ 0.9
+  at T = 400 and ``ham_conservative`` does not.
+
+If neither holds, a conserved momentum is not enough: the distractor
+impulses would be the first suspect (they add to the conserved momentum
+unless the model learns to zero them).
 
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
@@ -240,6 +269,12 @@ def build(name: str, args) -> Wrapped:
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none",
         )
+    elif name in ("ham_cyclic", "ham_cyclic_learned"):
+        core = HamiltonianCharModel(
+            N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
+            dt=args.dt, dissipation="none" if name == "ham_cyclic" else "learned",
+            gamma_init=args.gamma_init, n_cyclic=args.n_cyclic,
+        )
     elif name in ("ham_learned", "ham_geometry"):
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
@@ -304,7 +339,10 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
     steps_to_target, steps_run = float("nan"), 0
     t0 = time.perf_counter()
     for step in range(1, args.steps + 1):
-        x, y, mask = make(args.batch_size, args.seq_len, gen)
+        length = args.seq_len
+        if args.train_len_min:
+            length = int(torch.randint(args.train_len_min, args.seq_len + 1, (1,), generator=gen))
+        x, y, mask = make(args.batch_size, length, gen)
         loss, _ = masked_loss_acc(model(x), y, mask)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -365,7 +403,8 @@ def report(results: list[Result], args) -> str:
         (
             f"\n## Run steps={args.steps} T={args.seq_len} hidden={args.hidden_dim} "
             f"substeps={args.substeps} dt={args.dt} seeds={list(args.seeds)} "
-            f"lstm_forget_bias={args.lstm_forget_bias}\n"
+            f"lstm_forget_bias={args.lstm_forget_bias}"
+            + (f" train_len={args.train_len_min}-{args.seq_len}" if args.train_len_min else "") + "\n"
         ),
         ("| task | model | accuracy | params | learned γ median (90th pct) "
         "| geometry γ / stiffness λ | wall (s) |"),
@@ -441,7 +480,7 @@ def _float_or_none(text: str):
 
 MODELS = (
     "lstm", "transformer", "ham_conservative", "ham_learned", "ham_geometry",
-    "particles", "particles_dense",
+    "ham_cyclic", "ham_cyclic_learned", "particles", "particles_dense",
 )
 # The particle models cost O(T³) per sequence (tens of minutes per run at
 # T = 40 on CPU), so they are opt-in via --models.
@@ -471,6 +510,10 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     parser.add_argument("--tasks", nargs="+", default=list(TASKS), choices=list(TASKS))
     parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS), choices=list(MODELS))
+    parser.add_argument("--n-cyclic", type=int, default=16,
+                        help="cyclic (symmetry-protected) coordinates in ham_cyclic*")
+    parser.add_argument("--train-len-min", type=int, default=0,
+                        help="if > 0, draw each training batch's length from [this, --seq-len]")
     parser.add_argument("--eval-every", type=int, default=0,
                         help="check a fixed validation set every N steps and stop at --target (0 = off)")
     parser.add_argument("--target", type=float, default=0.9)
