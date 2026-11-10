@@ -878,7 +878,7 @@ def create_ui():
                         test_split_ratio_input = gr.Slider(label="Test Split Ratio", minimum=0.01, maximum=0.5, step=0.01, value=DEFAULT_CONFIG['test_split_ratio'])
 
                         gr.Markdown("### Model Architecture")
-                        model_type_input = gr.Dropdown(label="Model Family", choices=MODEL_CHOICES, value=DEFAULT_CONFIG['model_type'], elem_classes="gr-input")
+                        model_type_input = gr.Dropdown(label="Model Family", choices=MODEL_CHOICES, value=DEFAULT_CONFIG['model_type'], info="'particles' is experimental: cost grows with the cube of the context window; keep it under ~48.", elem_classes="gr-input")
                         embedding_dim_input = gr.Number(label="Embedding Dim", value=DEFAULT_CONFIG['embedding_dim'], precision=0, elem_classes="gr-input")
                         context_window_input = gr.Number(label="Context Window", value=DEFAULT_CONFIG['context_window'], precision=0, elem_classes="gr-input")
                         hidden_dim_input = gr.Number(label="Hidden Dim", value=DEFAULT_CONFIG['hidden_dim'], precision=0, elem_classes="gr-input")

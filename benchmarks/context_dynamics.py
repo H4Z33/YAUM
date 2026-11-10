@@ -5,6 +5,8 @@ Compares, on three synthetic tasks, an LSTM against two variants of
 learned energy as tokens arrive):
 
     ham_conservative   friction γ = 0: a purely Hamiltonian model
+    transformer        2 layers, 2 heads, sinusoidal positions (the
+                       mechanism the particle model is compared to)
     ham_learned        per-mode friction γ_i learned with the weights
     ham_geometry       ham_learned + dynamic geometry: the landscape is
                        bent by the content as it is read (joint
@@ -69,9 +71,39 @@ the diagnostic showed a bimodal outcome, also report how many seeds
 exceed 0.9. If the mean does not exceed the LSTM's, the diagnostic was
 noise or depended on the embedding size.
 
+Fifth pre-registered hypothesis (written 2026-11-10, before any model
+had been evaluated at a length other than the one it was trained on).
+Every earlier task is one a standard model solves, so the best outcome
+was a tie. Conservation predicts something specific: memory that does not
+fade with length. Train at T = 40, evaluate at T = 100, 200, 400
+(``--eval-lengths``), 5 seeds:
+
+* on ``recall_first``, ``ham_conservative`` keeps accuracy ≥ 0.9 at
+  T = 400 and loses less from T = 40 to T = 400 than the LSTM and the
+  transformer;
+* ``ham_learned`` loses more than ``ham_conservative`` on
+  ``recall_first`` (its friction, ~0.035 per token, erases a momentum
+  memory over hundreds of tokens) but holds ``count`` and ``lag`` better
+  than ``ham_conservative`` does.
+
+No prediction is made for the LSTM versus the transformer. If the
+conservative model degrades as fast as the LSTM, "conservation gives
+length-robust memory" is not supported by this implementation (chaos in
+the learned potential would be the first suspect).
+
+Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
+turned out to measure learning *speed* on ``assoc`` (see the audit
+diagnostic in the results file). ``--eval-every N --target A`` now
+records the first step at which accuracy on a fixed validation set
+reaches ``A`` and stops there; ``--steps`` is the cap.
+
 Run:
 
     python -m benchmarks.context_dynamics
+    python -m benchmarks.context_dynamics --models lstm transformer ham_conservative ham_learned \
+        --tasks recall_first count lag --seeds 0 1 2 3 4 --eval-lengths 100 200 400
+    python -m benchmarks.context_dynamics --tasks assoc --models lstm transformer particles_dense \
+        --steps 6000 --eval-every 100 --target 0.9 --seeds 0 1 2 3 4
     python -m benchmarks.context_dynamics --steps 3000 --seq-len 60 --seeds 0 1 2
 """
 from __future__ import annotations
@@ -81,7 +113,7 @@ import math
 import os
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -90,6 +122,7 @@ from torch import nn
 from yaum.models.hamiltonian import HamiltonianCharModel
 from yaum.models.particles import HamiltonianParticleModel
 from yaum.models.rnn import RNNCharModel
+from yaum.models.transformer import TransformerCharModel
 
 N_SYMBOLS = 8
 
@@ -196,6 +229,12 @@ def build(name: str, args) -> Wrapped:
     if name == "lstm":
         core = RNNCharModel(N_SYMBOLS, args.embedding_dim, args.hidden_dim, 1)
         set_forget_bias(core.lstm, args.lstm_forget_bias)
+    elif name == "transformer":
+        # Sinusoidal positions, so it can be evaluated at unseen lengths.
+        core = TransformerCharModel(
+            N_SYMBOLS, args.embedding_dim, args.hidden_dim, 2,
+            n_heads=2, max_context=2048, dropout=0.0,
+        )
     elif name == "ham_conservative":
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
@@ -239,6 +278,9 @@ class Result:
     gamma_q90: float = float("nan")
     geom_gamma_median: float = float("nan")
     stiffness_median: float = float("nan")
+    steps_to_target: float = float("nan")  # nan = target never reached (or not measured)
+    steps_run: int = 0
+    length_acc: dict = field(default_factory=dict)  # eval length -> accuracy
 
 
 def masked_loss_acc(logits, y, mask):
@@ -256,21 +298,38 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
     model = build(model_name, args)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     make = TASKS[task]
+    # Validation set for steps-to-target: fixed, and distinct from the
+    # final evaluation set, so stopping on it does not bias the report.
+    val = make(512, args.seq_len, torch.Generator().manual_seed(20_000 + seed))
+    steps_to_target, steps_run = float("nan"), 0
     t0 = time.perf_counter()
-    for _ in range(args.steps):
+    for step in range(1, args.steps + 1):
         x, y, mask = make(args.batch_size, args.seq_len, gen)
         loss, _ = masked_loss_acc(model(x), y, mask)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        steps_run = step
+        if args.eval_every and step % args.eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                _, val_acc = masked_loss_acc(model(val[0]), val[1], val[2])
+            model.train()
+            if float(val_acc) >= args.target:
+                steps_to_target = step
+                break
     wall = time.perf_counter() - t0
 
-    eval_gen = torch.Generator().manual_seed(10_000 + seed)
     model.eval()
+    length_acc = {}
     with torch.no_grad():
-        x, y, mask = make(1024, args.seq_len, eval_gen)
+        x, y, mask = make(1024, args.seq_len, torch.Generator().manual_seed(10_000 + seed))
         _, acc = masked_loss_acc(model(x), y, mask)
+        for length in args.eval_lengths:
+            xl, yl, ml = make(1024, length, torch.Generator().manual_seed(30_000 + seed + length))
+            _, acc_l = masked_loss_acc(model(xl), yl, ml)
+            length_acc[length] = float(acc_l)
     result = Result(
         task=task,
         model=model_name,
@@ -278,6 +337,9 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
         accuracy=float(acc),
         params=sum(p.numel() for p in model.parameters()),
         wall_s=wall,
+        steps_to_target=steps_to_target,
+        steps_run=steps_run,
+        length_acc=length_acc,
     )
     core = model.core
     if isinstance(core, (HamiltonianCharModel, HamiltonianParticleModel)) and core.dissipation == "learned":
@@ -325,6 +387,45 @@ def report(results: list[Result], args) -> str:
                 f"| {task} | `{model}` | {acc_m:.3f} ± {acc_s:.3f} | {rs[0].params:,} "
                 f"| {gamma} | {geo} | {_ms([r.wall_s for r in rs])[0]:.0f} |"
             )
+    if args.eval_every:
+        lines += [
+            "",
+            (f"Steps to reach {args.target:.2f} on a fixed validation set "
+            f"(checked every {args.eval_every} steps, cap {args.steps}; training stops there):"),
+            "",
+            "| task | model | reached | steps to target (those that reached) | per seed |",
+            "|---|---|---:|---:|---|",
+        ]
+        for task in TASKS:
+            for model in MODELS:
+                rs = [r for r in results if r.task == task and r.model == model]
+                if not rs:
+                    continue
+                hit = [r.steps_to_target for r in rs if math.isfinite(r.steps_to_target)]
+                mean = f"{statistics.mean(hit):.0f}" if hit else "—"
+                per = ", ".join(
+                    f"{r.steps_to_target:.0f}" if math.isfinite(r.steps_to_target)
+                    else f">{args.steps} ({r.accuracy:.2f})" for r in rs
+                )
+                lines.append(f"| {task} | `{model}` | {len(hit)}/{len(rs)} | {mean} | {per} |")
+    if args.eval_lengths:
+        lengths = list(args.eval_lengths)
+        lines += [
+            "",
+            (f"Length generalisation: trained at T={args.seq_len}, evaluated at other lengths "
+            "(mean ± std over seeds):"),
+            "",
+            "| task | model | T=" + f"{args.seq_len} | " + " | ".join(f"T={n}" for n in lengths) + " |",
+            "|---|---|" + "---:|" * (len(lengths) + 1),
+        ]
+        for task in TASKS:
+            for model in MODELS:
+                rs = [r for r in results if r.task == task and r.model == model]
+                if not rs:
+                    continue
+                cells = ["{:.3f} ± {:.3f}".format(*_ms([r.accuracy for r in rs]))]
+                cells += ["{:.3f} ± {:.3f}".format(*_ms([r.length_acc[n] for r in rs])) for n in lengths]
+                lines.append(f"| {task} | `{model}` | " + " | ".join(cells) + " |")
     lines.append("")
     lines.append(
         "Chance accuracy: recall_first, lag and assoc 0.125; count ≈ 0.2. "
@@ -338,7 +439,13 @@ def _float_or_none(text: str):
     return None if text.lower() == "none" else float(text)
 
 
-MODELS = ("lstm", "ham_conservative", "ham_learned", "ham_geometry", "particles", "particles_dense")
+MODELS = (
+    "lstm", "transformer", "ham_conservative", "ham_learned", "ham_geometry",
+    "particles", "particles_dense",
+)
+# The particle models cost O(T³) per sequence (tens of minutes per run at
+# T = 40 on CPU), so they are opt-in via --models.
+DEFAULT_MODELS = ("lstm", "transformer", "ham_conservative", "ham_learned", "ham_geometry")
 
 
 def main() -> None:
@@ -363,7 +470,12 @@ def main() -> None:
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     parser.add_argument("--tasks", nargs="+", default=list(TASKS), choices=list(TASKS))
-    parser.add_argument("--models", nargs="+", default=list(MODELS), choices=list(MODELS))
+    parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS), choices=list(MODELS))
+    parser.add_argument("--eval-every", type=int, default=0,
+                        help="check a fixed validation set every N steps and stop at --target (0 = off)")
+    parser.add_argument("--target", type=float, default=0.9)
+    parser.add_argument("--eval-lengths", type=int, nargs="*", default=[],
+                        help="also evaluate at these sequence lengths after training")
     parser.add_argument(
         "--output",
         default=os.path.join(os.path.dirname(__file__), "context_dynamics_results.md"),

@@ -44,6 +44,7 @@ yaum/models/               rnn, transformer, hamiltonian, particles (many-body) 
 yaum/ui/app.py             Gradio UI (global APP_STATE, background training thread)
 benchmarks/compare_training.py   training-time comparison → results.md
 benchmarks/context_dynamics.py   context-time comparison → context_dynamics_results.md
+benchmarks/diagnostics/          one-off probes behind tables in the results file (not benchmarks)
 docs/ARTICLE.md            narrative + results + corrections table
 docs/LESSONS.md            lessons learned, open problems, backlog
 ```
@@ -55,10 +56,10 @@ docs/LESSONS.md            lessons learned, open problems, backlog
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-cpu.txt
 
-python -m pytest -q                     # ~160 tests, ~15 s on CPU
+python -m pytest -q                     # ~180 tests, ~40 s on CPU
 ruff check .                            # only BLE001 (deliberate catch-alls at UI/thread boundaries) should remain
 python -m benchmarks.compare_training   # ~1 min, appends to benchmarks/results.md
-python -m benchmarks.context_dynamics   # ~25 min on CPU, appends to benchmarks/context_dynamics_results.md
+python -m benchmarks.context_dynamics   # ~30 min on CPU (particle models are opt-in via --models: tens of min per run), appends to benchmarks/context_dynamics_results.md
 python -m yaum.ui.app                   # UI on 127.0.0.1:7860; --share / --server-name / --server-port
 ```
 
@@ -119,6 +120,9 @@ scratch runs so you don't pollute the record.
    Coupled or chaotic dynamics can pass every physics test and still be
    untrainable.
 3. **Seeds**: ≥ 3, report mean ± std. Call differences inside seed noise a tie.
+8. **Budget**: accuracy after a fixed number of steps measures learning
+   speed. Before calling a model stuck or unable, run a longer budget or
+   use `--eval-every/--target` (steps to reach a target).
 4. **Fixed evaluation set**: identical held-out windows for all variants.
 5. **Pre-register** the hypothesis in the benchmark docstring *before*
    the first run, and report the result even when it goes against the

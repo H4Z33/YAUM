@@ -41,9 +41,9 @@ results — including the ones that did not go the project's way.
   (0.69 vs 0.40). A first "dynamic geometry" version failed to train
   (exploding gradients). A many-body version, where every token is a
   particle with content-dependent attraction and repulsion
-  (`yaum/models/particles.py`), shows some promise on binding (two of three
-  seeds 0.50 and 0.55, one at chance) but stays at chance on the three
-  40-token tasks. See `docs/ARTICLE.md` §4.
+  (`yaum/models/particles.py`), can solve binding when particles are born
+  close together, but learns it far more slowly than a small transformer
+  and has not yet learned the 40-token tasks. See `docs/ARTICLE.md` §4.
 
 ## Key features
 
