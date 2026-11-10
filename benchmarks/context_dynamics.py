@@ -194,6 +194,24 @@ seeds, distractor charges exactly zero; cost 1.0: 0.963 at T = 1000; the
 cost-0 control fails (0.142); at cost 0.01 one seed fails, the risk
 noted above. Best of 13 LSTM settings: 0.948 +- 0.071 at T = 10,000.)
 
+Eleventh pre-registered hypothesis (written 2026-11-10, before either
+new task had been run with any model). Hypothesis 10 passed on a task
+where the item and the distractors come from different symbol sets, so
+a charge that sees only the current token is enough by construction.
+Two tasks probe that boundary; trained on 20–40, 5 seeds, own readout,
+``ham_neutral`` at charge cost 0.1 against the LSTM at forget bias 3
+and 8, evaluated at T = 400, 1000 and 4000:
+
+* ``recall_mid``: the item (symbols 0–7) sits at a uniformly random
+  position among distractors (symbols 8–15). Prediction: ``ham_neutral``
+  ≥ 0.99 at every length (position should not matter to a per-token
+  charge).
+* ``recall_same``: every token is drawn from symbols 0–7 and the answer
+  is the first one. Prediction: ``ham_neutral`` **fails**, below the
+  better LSTM at T = 400, because no per-token charge can tell the first
+  token from a later copy of the same symbol. If it passes, the model
+  found a route I did not foresee and that must be explained.
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now
@@ -245,6 +263,29 @@ def task_recall_first(batch, T, gen):
     return x, y, mask
 
 
+def task_recall_mid(batch, T, gen):
+    """Like ``recall_first`` but the item is at a random position."""
+    x = torch.randint(N_SYMBOLS, 2 * N_SYMBOLS, (batch, T), generator=gen)
+    item = torch.randint(0, N_SYMBOLS, (batch,), generator=gen)
+    pos = torch.randint(0, T - 1, (batch,), generator=gen)
+    x[torch.arange(batch), pos] = item
+    y = torch.zeros(batch, T, dtype=torch.long)
+    y[:, -1] = item
+    mask = torch.zeros(batch, T, dtype=torch.bool)
+    mask[:, -1] = True
+    return x, y, mask
+
+
+def task_recall_same(batch, T, gen):
+    """Recall the first token when distractors use the *same* symbols."""
+    x = torch.randint(0, N_SYMBOLS, (batch, T), generator=gen)
+    y = torch.zeros(batch, T, dtype=torch.long)
+    y[:, -1] = x[:, 0]
+    mask = torch.zeros(batch, T, dtype=torch.bool)
+    mask[:, -1] = True
+    return x, y, mask
+
+
 def task_count(batch, T, gen, max_depth=N_SYMBOLS - 1):
     x = torch.zeros(batch, T, dtype=torch.long)
     y = torch.zeros(batch, T, dtype=torch.long)
@@ -288,6 +329,8 @@ def task_assoc(batch, T, gen, pairs=4):
 
 TASKS = {
     "recall_first": task_recall_first,
+    "recall_mid": task_recall_mid,
+    "recall_same": task_recall_same,
     "count": task_count,
     "lag": task_lag,
     "assoc": task_assoc,
