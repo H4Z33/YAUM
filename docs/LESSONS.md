@@ -253,11 +253,12 @@ hash instead of deleting them.
       compaction. Watch for drift and forgetting (continual-learning risks).
 - [x] **Selection rule for the conserved momenta**: done 2026-11-10
       (`ham_neutral`: ReLU charge + L1 charge cost; ARTICLE §4.2).
-- [ ] **Generalise the selection rule** (top priority). (a) A task where
-      the item to store is marked by position or by an earlier token,
-      not by its symbol set: needs a state-dependent charge (e.g. a
-      charge that an already-written memory suppresses, an exclusion
-      principle). (b) `count`, `lag`, `assoc` with cyclic + neutral
+- [ ] **Generalise the selection rule** (top priority). (a) Measured
+      limit (hypothesis 11): on `recall_same` (distractors share the
+      item's symbols) `ham_neutral` scores 0.31 at T=40 and the LSTM
+      1.000 at T=4000. Needs a state-dependent charge (e.g. a charge
+      that an already-written memory suppresses, an exclusion
+      principle); `recall_same` is the test. (b) `count`, `lag`, `assoc` with cyclic + neutral
       coordinates mixed with ordinary ones. (c) Remove the cost sweep:
       anneal the charge cost, or guard against dead first-token charges.
       (d) More seeds (≥ 10) for the comparison with the best LSTM.

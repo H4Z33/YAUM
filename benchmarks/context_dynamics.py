@@ -212,6 +212,10 @@ and 8, evaluated at T = 400, 1000 and 4000:
   token from a later copy of the same symbol. If it passes, the model
   found a route I did not foresee and that must be explained.
 
+(Result: supported, both halves. ``recall_mid``: 1.000 at every length;
+LSTM 0.95 at T = 4000. ``recall_same``: 0.307 at T = 40 and chance
+beyond; the LSTM is exact to T = 4000.)
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now

@@ -411,6 +411,11 @@ show:
   symbol sets, so a charge that depends only on the current token is
   enough by construction. A task where the same symbol must be stored
   once and ignored later needs a charge that depends on the state.
+  This was then tested (hypothesis 11, pre-registered both ways). With
+  the item at a random position the result holds (1.000 at T = 4000;
+  LSTM 0.95). With distractors drawn from the item's own symbols the
+  model fails completely (0.31 even at T = 40) and the LSTM is exact to
+  T = 4000, because its gate can depend on what it already holds.
 * The charge cost needed a sweep: with no cost the model fails like its
   predecessors, at 0.01 one seed in five never learns to write.
 * A conserved memory cannot be overwritten or forgotten. That is the

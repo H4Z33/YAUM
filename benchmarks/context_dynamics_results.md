@@ -315,3 +315,23 @@ nothing touches the memory after the write. Limits: one task; the first
 token and the distractors come from different symbol sets, so a
 per-token charge is sufficient here by construction; the charge cost
 needed a sweep (0.01 loses a seed).
+
+## Run 2026-11-10: where a per-token charge is and is not enough (hypothesis 11). steps=1500, hidden=64, trained on 20–40, seeds=[0, 1, 2, 3, 4]
+
+Own readout, mean ± std over 5 seeds. `ham_neutral` at charge cost 0.1.
+
+| task | model | T=40 | T=400 | T=1000 | T=4000 |
+|---|---|---:|---:|---:|---:|
+| `recall_mid` | `ham_neutral` | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | **1.000 ± 0.000** |
+| `recall_mid` | `lstm`, forget bias 3 | 1.000 ± 0.000 | 0.984 ± 0.035 | 0.978 ± 0.045 | 0.951 ± 0.052 |
+| `recall_mid` | `lstm`, forget bias 8 | 1.000 ± 0.000 | 0.994 ± 0.012 | 0.972 ± 0.034 | 0.891 ± 0.127 |
+| `recall_same` | `ham_neutral` | 0.307 ± 0.097 | 0.191 ± 0.071 | 0.161 ± 0.056 | 0.146 ± 0.041 |
+| `recall_same` | `lstm`, forget bias 3 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | **1.000 ± 0.001** |
+| `recall_same` | `lstm`, forget bias 8 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 |
+
+Hypothesis 11 **supported, both halves**. Position does not matter to
+the neutral-token model. When distractors share the item's symbols it
+fails outright, and does not even fit the training lengths (0.307 at
+T=40), while the LSTM is exact to T=4000: its input gate depends on its
+state, so it can close after the first token. The charge here depends
+only on the current token.
