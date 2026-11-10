@@ -297,3 +297,25 @@ def test_neutral_tokens_have_exactly_zero_charge():
         assert float(model.last_charge_mean) == 0.0
     with pytest.raises(ValueError):
         HamiltonianCharModel(7, 5, 8, 2, n_cyclic=3, cyclic_charge="hard")
+
+
+def test_exclusion_charge_blocks_writes_to_an_occupied_memory():
+    """With a strong exclusion term, only the first token changes the conserved momenta."""
+    torch.manual_seed(0)
+    model = HamiltonianCharModel(7, 5, 8, 2, n_cyclic=3, cyclic_charge="exclusion")
+    x = torch.randn(4, 30, 5)
+    with torch.no_grad():
+        model.cyclic_charge.weight.zero_()  # every token asks for the same charge, 1
+        model._exclusion.fill_(50.0)        # u = 50: any occupation above 0.02 blocks
+        model.impulse.weight[-3:].mul_(10.0)  # make the first write clearly occupy the memory
+        other = x.clone()
+        other[:, 1:] = torch.randn(4, 29, 5)  # same first token, different later tokens
+        _, (_, p_a) = model(x, None)
+        _, (_, p_b) = model(other, None)
+        assert float(p_a[:, -3:].pow(2).mean(dim=-1).min()) > 0.02
+        assert torch.equal(p_a[:, -3:], p_b[:, -3:])  # later tokens left no trace at all
+        # With no exclusion the same tokens keep writing.
+        model._exclusion.fill_(-50.0)
+        _, (_, p_free_a) = model(x, None)
+        _, (_, p_free_b) = model(other, None)
+        assert not torch.allclose(p_free_a[:, -3:], p_free_b[:, -3:])

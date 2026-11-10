@@ -160,12 +160,22 @@ class HamiltonianCharModel(nn.Module):
         # times 1000 tokens still exceeds the signal (hypotheses 7–9).
         if cyclic_charge and not self.n_cyclic:
             raise ValueError("cyclic_charge needs n_cyclic > 0")
-        if cyclic_charge not in (False, True, "sigmoid", "neutral"):
-            raise ValueError("cyclic_charge must be False, True, 'sigmoid' or 'neutral'")
+        if cyclic_charge not in (False, True, "sigmoid", "neutral", "exclusion"):
+            raise ValueError(
+                "cyclic_charge must be False, True, 'sigmoid', 'neutral' or 'exclusion'"
+            )
         self.charge_kind = "sigmoid" if cyclic_charge is True else cyclic_charge
         self.cyclic_charge = nn.Linear(embedding_dim, 1) if cyclic_charge else None
-        if self.charge_kind == "neutral":
+        if self.charge_kind in ("neutral", "exclusion"):
             nn.init.constant_(self.cyclic_charge.bias, 1.0)  # start charged: a dead gate cannot recover
+        # "exclusion": the charge also falls with the occupation of the
+        # conserved memory (its mean squared momentum), g = relu(w·x + b − u·n),
+        # so a memory that already holds something refuses further charge.
+        # u = softplus(_exclusion) ≥ 0, initialised to 1.
+        self._exclusion = (
+            nn.Parameter(torch.tensor(math.log(math.e - 1.0)))
+            if self.charge_kind == "exclusion" else None
+        )
         self.last_charge_mean = None
 
         if dissipation == "learned":
@@ -329,6 +339,8 @@ class HamiltonianCharModel(nn.Module):
         kicks = self.impulse(embedded)  # (B, T, h)
         if self.cyclic_charge is not None:
             raw = self.cyclic_charge(embedded)  # (B, T, 1)
+        exclusion = self.charge_kind == "exclusion"
+        if self.cyclic_charge is not None and not exclusion:
             charge = torch.relu(raw) if self.charge_kind == "neutral" else torch.sigmoid(raw)
             self.last_charge_mean = charge.mean()
             kicks = kicks * (self._active + (1.0 - self._active) * charge)
@@ -349,8 +361,18 @@ class HamiltonianCharModel(nn.Module):
             kicks[..., -self.n_cyclic:].mean(dim=(0, 1)).pow(2).sum() if self.n_cyclic else None
         )
         outputs = []
+        charges = []
         for t in range(seq_len):
-            p = p + kicks[:, t]
+            if exclusion:
+                # State-dependent charge: depends on the conserved momenta
+                # only, so the flow (which never changes them) and the
+                # charge cannot feed back on each other within a token.
+                occupation = p[:, -self.n_cyclic:].pow(2).mean(dim=-1, keepdim=True)
+                charge_t = torch.relu(raw[:, t] - F.softplus(self._exclusion) * occupation)
+                charges.append(charge_t)
+                p = p + kicks[:, t] * (self._active + (1.0 - self._active) * charge_t)
+            else:
+                p = p + kicks[:, t]
             if dynamic:
                 q, p, phi, pi = self._flow_joint(q, p, phi, pi, self.n_substeps, self.dt)
             else:
@@ -358,6 +380,8 @@ class HamiltonianCharModel(nn.Module):
             # The readout sees only the matter: the geometry acts on the
             # prediction solely by changing how the matter moves.
             outputs.append(torch.cat([q * self._active, p / self.mass], dim=-1))
+        if exclusion:
+            self.last_charge_mean = torch.stack(charges, dim=1).mean()
         states = torch.stack(outputs, dim=1)
         logits = self.fc(self.readout_norm(states))
         return logits, ((q, p, phi, pi) if dynamic else (q, p))

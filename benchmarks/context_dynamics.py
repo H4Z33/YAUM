@@ -216,6 +216,28 @@ and 8, evaluated at T = 400, 1000 and 4000:
 LSTM 0.95 at T = 4000. ``recall_same``: 0.307 at T = 40 and chance
 beyond; the LSTM is exact to T = 4000.)
 
+Twelfth pre-registered hypothesis (written 2026-11-10, before any model
+with a state-dependent charge had been trained). Hypothesis 11 located
+the limit: on ``recall_same`` no charge that sees only the current token
+can separate the first token from later copies. ``ham_exclusion`` makes
+the charge depend on the conserved memory itself,
+g = relu(w·x + b − u·n), where n is the mean squared conserved momentum
+(the "occupation") just before the token arrives and u ≥ 0 is learned:
+an occupied memory refuses further charge, an exclusion principle. When
+g is exactly zero the momenta stay exactly conserved, as before.
+Trained on 20–40, 5 seeds, own readout, charge cost 0 and 0.1 (both
+declared), evaluated at T = 400, 1000 and 4000. Predictions:
+
+* ``recall_same``: ≥ 0.99 at T = 4000 for at least one cost. The LSTM
+  scores 1.000 there, so a tie is the best possible outcome.
+* ``recall_first`` and ``recall_mid`` at the same cost: still ≥ 0.99 at
+  T = 4000 (the new term must not cost what hypothesis 10 gained).
+
+Risk noted in advance: training lengths of 20–40 only punish a leak
+that matters within 40 tokens, so the blocked charge may be small rather
+than exactly zero and show up only at T = 4000; the charge cost is the
+pressure toward exact zero.
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now
@@ -390,12 +412,13 @@ def build(name: str, args) -> Wrapped:
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none",
         )
-    elif name in ("ham_cyclic", "ham_cyclic_learned", "ham_charge", "ham_neutral"):
+    elif name in ("ham_cyclic", "ham_cyclic_learned", "ham_charge", "ham_neutral", "ham_exclusion", "ham_exclusion"):
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none" if name == "ham_cyclic" else "learned",
             gamma_init=args.gamma_init, n_cyclic=args.n_cyclic,
-            cyclic_charge={"ham_charge": True, "ham_neutral": "neutral"}.get(name, False),
+            cyclic_charge={"ham_charge": True, "ham_neutral": "neutral",
+                           "ham_exclusion": "exclusion"}.get(name, False),
         )
     elif name in ("ham_learned", "ham_geometry"):
         core = HamiltonianCharModel(
@@ -630,7 +653,7 @@ def _float_or_none(text: str):
 
 MODELS = (
     "lstm", "transformer", "ham_conservative", "ham_learned", "ham_geometry",
-    "ham_cyclic", "ham_cyclic_learned", "ham_charge", "ham_neutral",
+    "ham_cyclic", "ham_cyclic_learned", "ham_charge", "ham_neutral", "ham_exclusion",
     "particles", "particles_dense",
 )
 # The particle models cost O(T³) per sequence (tens of minutes per run at
