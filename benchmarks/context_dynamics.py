@@ -655,7 +655,8 @@ def main() -> None:
              "PyTorch's default, equivalent to --lstm-forget-bias none).",
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
-    parser.add_argument("--tasks", nargs="+", default=list(TASKS), choices=list(TASKS))
+    parser.add_argument("--tasks", nargs="+", default=["recall_first", "count", "lag", "assoc"],
+                        choices=list(TASKS))
     parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS), choices=list(MODELS))
     parser.add_argument("--n-cyclic", type=int, default=16,
                         help="cyclic (symmetry-protected) coordinates in ham_cyclic*")
