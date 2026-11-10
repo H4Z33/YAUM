@@ -335,3 +335,45 @@ fails outright, and does not even fit the training lengths (0.307 at
 T=40), while the LSTM is exact to T=4000: its input gate depends on its
 state, so it can close after the first token. The charge here depends
 only on the current token.
+
+## Run 2026-11-10: a state-dependent (exclusion) charge (hypothesis 12). hidden=64, trained on 20–40, seeds=[0, 1, 2, 3, 4]
+
+`ham_exclusion`, own readout, mean ± std over 5 seeds. The registered
+test is the 1500-step block; the 4500-step block is a follow-up added
+after seeing it (research-hygiene rule 8), not part of the registration.
+
+| steps | task | charge cost | T=40 | T=400 | T=1000 | T=4000 |
+|---:|---|---:|---:|---:|---:|---:|
+| 1500 | `recall_same` | 0 | 0.971 ± 0.064 | 0.972 ± 0.062 | 0.971 ± 0.065 | 0.977 ± 0.052 |
+| 1500 | `recall_same` | 0.1 | 0.961 ± 0.087 | 0.957 ± 0.095 | 0.960 ± 0.090 | 0.956 ± 0.098 |
+| 1500 | `recall_mid` | 0 | 0.976 ± 0.053 | 0.932 ± 0.096 | 0.909 ± 0.135 | 0.889 ± 0.156 |
+| 1500 | `recall_mid` | 0.1 | 0.949 ± 0.070 | 0.948 ± 0.071 | 0.954 ± 0.064 | 0.953 ± 0.065 |
+| 1500 | `recall_first` | 0 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 |
+| 1500 | `recall_first` | 0.1 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 |
+| 4500 | `recall_same` | 0 | 0.997 ± 0.007 | 0.997 ± 0.007 | 0.994 ± 0.013 | 0.997 ± 0.007 |
+| 4500 | `recall_same` | 0.1 | 0.975 ± 0.055 | 0.948 ± 0.072 | 0.949 ± 0.071 | 0.954 ± 0.062 |
+| 4500 | `recall_mid` | 0 | 0.978 ± 0.048 | 0.946 ± 0.077 | 0.922 ± 0.124 | 0.903 ± 0.157 |
+| 4500 | `recall_mid` | 0.1 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 |
+
+For reference (hypothesis 11): `ham_neutral` 0.146 and LSTM 1.000 on
+`recall_same` at T=4000; `ham_neutral` 1.000 and LSTM 0.951 on
+`recall_mid`.
+
+Hypothesis 12 **not supported as stated**: `recall_same` reaches
+0.96–0.98 at T=4000, not 0.99, and `recall_mid` fell from 1.000 to
+0.89–0.95. What the numbers do show:
+
+* The exclusion charge does the job it was built for. `recall_same`
+  goes from 0.31 (cannot fit T=40) to 0.96–0.98, and accuracy is flat
+  from T=40 to T=4000: the leak named as the risk did not appear there.
+* The shortfall is at the training length and comes in steps of one
+  symbol in eight. Failing seeds sit at 0.87–0.89 at T=40 (7/8 = 0.875)
+  with the others at 1.000, the signature of one symbol whose charge
+  died (the dead-ReLU risk noted under hypothesis 10). Not verified by
+  inspecting the charges.
+* No single cost passes both tasks even at 3× the steps. Cost 0 solves
+  `recall_same` (0.997) but leaks on `recall_mid` (one seed decays with
+  length); cost 0.1 solves `recall_mid` (1.000) but leaves one seed
+  short on `recall_same`.
+* The LSTM is still the better model on `recall_same` (1.000, no
+  tuning).

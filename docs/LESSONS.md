@@ -49,6 +49,10 @@ rewrite past entries. Newest session first.
     the first token and the distractors from different symbol sets, so
     a per-token charge suffices by construction. State that next to the
     result.
+31. **A failure quantised in units of 1/8 is one symbol, not noise.**
+    Seeds at 0.873–0.892 next to seeds at 1.000 are not "0.95 ± 0.07";
+    the mean hides a discrete failure. Read per-seed numbers before
+    reporting a mean.
 22. **Diagnostics that back a recorded table belong in the repo.** The
     Big Bang script lived in a scratch directory; it is now
     `benchmarks/diagnostics/`.
@@ -258,7 +262,14 @@ hash instead of deleting them.
       item's symbols) `ham_neutral` scores 0.31 at T=40 and the LSTM
       1.000 at T=4000. Needs a state-dependent charge (e.g. a charge
       that an already-written memory suppresses, an exclusion
-      principle); `recall_same` is the test. (b) `count`, `lag`, `assoc` with cyclic + neutral
+      principle); `recall_same` is the test. First attempt
+      (`ham_exclusion`, hypothesis 12): 0.96–0.98, flat to T=4000, but
+      seeds fail in steps of one symbol in eight (0.875 at T=40) and no
+      single charge cost passes both `recall_same` and `recall_mid`.
+      Next: inspect per-symbol charges on a failing seed to confirm a
+      dead charge, then remove the failure mode (anneal the cost from
+      0; a straight-through or leaky gradient below zero) instead of
+      sweeping the cost. (b) `count`, `lag`, `assoc` with cyclic + neutral
       coordinates mixed with ordinary ones. (c) Remove the cost sweep:
       anneal the charge cost, or guard against dead first-token charges.
       (d) More seeds (≥ 10) for the comparison with the best LSTM.

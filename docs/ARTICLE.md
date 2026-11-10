@@ -416,6 +416,13 @@ show:
   LSTM 0.95). With distractors drawn from the item's own symbols the
   model fails completely (0.31 even at T = 40) and the LSTM is exact to
   T = 4000, because its gate can depend on what it already holds.
+  A charge that also depends on the memory's own occupation (an
+  occupied memory refuses further charge; `ham_exclusion`, hypothesis
+  12) lifts that task from 0.31 to 0.96–0.98, flat out to T = 4000, but
+  missed its registered bar of 0.99 and cost accuracy on the
+  random-position task (1.000 → 0.89–0.95). With 3× the steps each task
+  is solved at one charge cost and no cost solves both. The LSTM needs
+  no such tuning here.
 * The charge cost needed a sweep: with no cost the model fails like its
   predecessors, at 0.01 one seed in five never learns to write.
 * A conserved memory cannot be overwritten or forgotten. That is the
@@ -461,6 +468,7 @@ show:
 | (pre-registered) "the conservative model keeps recall ≥ 0.9 at 10× the training length and degrades less than the LSTM" | Not supported: chance by T = 100. The memory is a rotating phase the readout cannot follow (§4.2). |
 | (pre-registered) "with cyclic coordinates the model's own recall is ≥ 0.9 at T = 400" | Not supported (0.18–0.35). The state still holds the token perfectly at T = 1000 (fresh readout 1.000 on 10/10 runs vs LSTM 0.90), but distractors drift the conserved momentum and the trained readout cannot follow. |
 | (pre-registered, three times) "a soft charge / a write cost / a net-force penalty lets the model read its conserved memory at T = 400" | Not supported (0.15–0.49). Each shrank the per-token leak without making it zero. A charge that can be exactly zero (hypothesis 10) was needed: 1.000 to T = 10,000. |
+| (pre-registered) "an exclusion charge reaches ≥ 0.99 at T = 4000 when distractors share the item's symbols, without losing the other recall tasks" | Not supported as stated: 0.96–0.98 (from 0.15, flat with length), and the random-position task fell to 0.89–0.95. At 3× the steps each task passes at one charge cost; no cost passes both. |
 | "LSTM 0.875 at T = 1000" as the bar for long recall | Under-tuned for this test. Forget bias 8 or lr 1e-2 gives 0.95–0.97 at T = 1000 and 0.95 at T = 10,000. Comparisons now quote the best of 13 settings. |
 | "On `assoc` the LSTM leads clearly (0.69)" as the bar; "dense birth is bimodal: a seed finds the binding solution or stalls near 0.5" | Both are artefacts of the 1500-step budget. At 6000 steps the LSTM reaches 0.99 and the "stalled" dense seeds reach 0.79–1.00 (they were slow, not stuck). A small transformer, never benchmarked before, scores 1.000 at 1500 steps on all seeds and is the real bar. See the 2026-11-10 audit diagnostic in the results file. |
 

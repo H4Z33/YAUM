@@ -238,6 +238,13 @@ that matters within 40 tokens, so the blocked charge may be small rather
 than exactly zero and show up only at T = 4000; the charge cost is the
 pressure toward exact zero.
 
+(Result: not supported as stated. ``recall_same`` 0.956–0.977 at
+T = 4000, up from 0.146 and flat with length, but below 0.99;
+``recall_mid`` fell to 0.89–0.95; ``recall_first`` stayed 1.000. A
+follow-up at 4500 steps passes each task at one cost (``recall_same``
+0.997 at cost 0, ``recall_mid`` 1.000 at cost 0.1) but no cost passes
+both.)
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now
