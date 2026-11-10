@@ -321,6 +321,58 @@ seed 0.93) versus LSTM 0.678 ± 0.060 and sparse-born particles
 and its outcome is strongly seed-dependent (bimodal: a seed either finds
 the binding solution or stalls near 0.5).
 
+### 4.2 Memory at lengths never trained on: rotation, then a conservation law
+
+Every task above is one a standard model solves, so a tie was the best
+possible outcome. Conservation predicts something sharper: memory that
+does not fade with length. Models were trained on `recall_first` at
+T = 40 and evaluated on longer sequences (5 seeds; results file,
+2026-11-10).
+
+**The registered prediction failed.** `ham_conservative` falls to chance
+by T = 100 (0.146); the LSTM holds 0.865 at T = 400. (The friction model
+did keep `count` and `lag` at 0.92 and 0.99 out to T = 400, where the
+transformer is at chance on both.)
+
+**Why: the memory rotates.** Accuracy oscillates with length: 1.00 at
+T = 30, 40, 50 and exactly 0.000, *below chance*, at T = 36 and 44. A
+fresh linear readout fitted on the frozen model scores 1.000 at T = 44
+and T = 100. The first token is stored as the phase of an oscillation
+(period ≈ 10 tokens) and the trained readout only matches that phase at
+the trained length. The cause is in the design: every coordinate has a
+restoring force (κ > 0), so every mode oscillates and nothing can hold
+still. The memory also genuinely fades (probe 0.64 at T = 400).
+
+**The cure physics names: a symmetry.** If H does not depend on a
+coordinate, the conjugate momentum is exactly conserved (Noether).
+`n_cyclic=16` removes 16 of the 64 coordinates from V and from friction;
+a test confirms their momenta are bit-for-bit unchanged by the flow.
+
+**Result (hypothesis 6):** not supported as stated, and the first result
+in this project that favours the physics on any measure.
+
+| at T = 1000, trained on 20–40 | own readout | fresh linear readout (what the state still holds) |
+|---|---:|---:|
+| LSTM | **0.869 ± 0.092** | 0.899 ± 0.107 |
+| `ham_conservative` | 0.140 | 0.327 ± 0.197 |
+| `ham_cyclic` | 0.125 | **1.000 ± 0.000** |
+| `ham_cyclic_learned` | 0.131 | **1.000 ± 0.000** |
+
+With the symmetry, the first token is perfectly recoverable at 25× the
+training length on all 10 runs, where the LSTM's state has started to
+lose it. But the model cannot *use* it end to end: its own readout is at
+chance by T = 400, and the LSTM is far better there. The reason is
+measured: distractor tokens push the conserved momentum by ~8% of a
+first token's push, with a small consistent bias, and over 1000 tokens
+that bias moves the memory ~7× the size of the signal. A re-fitted
+readout re-centres; a fixed one cannot.
+
+**What is missing** is a rule for which tokens may couple to the
+conserved quantity, a *selection rule*. The LSTM has one (its input
+gate). Note the honest reading: this shows a conservation law protects
+information better than a learned gate does, not that the model is
+better; and "a fresh readout per length" is a probe, not a usable model.
+
 ---
 
 ## 5. Related work worth reading
@@ -355,6 +407,8 @@ the binding solution or stalls near 0.5).
 | (first context-time run) "Hamiltonian models solve long recall where the LSTM stays at chance" | Artefact of PyTorch's LSTM forget-gate init. With forget bias 3 the LSTM solves it too, and it matches or beats the Hamiltonian models on every task. |
 | (pre-registered) "the many-body model beats single-particle models on `assoc` and is at least as good on recall/count" | Not supported: a noisy tie on `assoc` (0.39 ± 0.23), chance on recall, count and lag. |
 | (diagnostic, 3 seeds, embedding 32) "dense-born particles solve `assoc` (0.81, two seeds ≈ 0.99), above the LSTM" | Not confirmed by the pre-registered 5-seed run at embedding 16: 0.571 ± 0.206 vs LSTM 0.678. |
+| (pre-registered) "the conservative model keeps recall ≥ 0.9 at 10× the training length and degrades less than the LSTM" | Not supported: chance by T = 100. The memory is a rotating phase the readout cannot follow (§4.2). |
+| (pre-registered) "with cyclic coordinates the model's own recall is ≥ 0.9 at T = 400" | Not supported (0.18–0.35). The state still holds the token perfectly at T = 1000 (fresh readout 1.000 on 10/10 runs vs LSTM 0.90), but distractors drift the conserved momentum and the trained readout cannot follow. |
 | "On `assoc` the LSTM leads clearly (0.69)" as the bar; "dense birth is bimodal: a seed finds the binding solution or stalls near 0.5" | Both are artefacts of the 1500-step budget. At 6000 steps the LSTM reaches 0.99 and the "stalled" dense seeds reach 0.79–1.00 (they were slow, not stuck). A small transformer, never benchmarked before, scores 1.000 at 1500 steps on all seeds and is the real bar. See the 2026-11-10 audit diagnostic in the results file. |
 
 ---

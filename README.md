@@ -45,6 +45,15 @@ results — including the ones that did not go the project's way.
   close together, but learns it far more slowly than a small transformer
   and has not yet learned the 40-token tasks. See `docs/ARTICLE.md` §4.
 
+* **Length generalisation** (trained on 40 tokens, tested up to 1000).
+  With every coordinate oscillating, the Hamiltonian memory is a rotating
+  phase and its readout fails off the training length. Making some
+  coordinates symmetric (cyclic) gives exactly conserved momenta
+  (Noether): the first token is then perfectly recoverable from the
+  state at 1000 tokens (fresh linear readout 1.000 on 10/10 runs; LSTM
+  0.90), but the model's own readout still fails by 400 tokens, where
+  the LSTM scores 0.93. See `docs/ARTICLE.md` §4.2.
+
 ## Key features
 
 * **Symplectic integrators:** leapfrog, Yoshida 4th order, Langevin (OBABO,

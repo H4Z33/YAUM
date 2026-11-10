@@ -16,6 +16,22 @@ rewrite past entries. Newest session first.
     model was described as "a cousin of attention" for two days without
     a transformer in the table. It solves `assoc` in 1500 steps on every
     seed with 7k parameters.
+23. **Test where the idea should win, not where everything ties.** Two
+    days of tasks that standard models solve could only produce ties.
+    One off-distribution test (longer sequences) produced the project's
+    first surprising results in an afternoon.
+24. **Evaluate next to the training point, not only far from it.**
+    Accuracy 1.000 at T=40 and 0.000 at T=44 exposed a rotating memory
+    that "0.15 at T=100" only reported as failure. Below-chance accuracy
+    means information is present and misread.
+25. **Separate "is the information there" from "can the model use it".**
+    A linear probe on the frozen state answered the first; the model's
+    own accuracy answers the second. They disagreed completely (1.000 vs
+    0.13 at T=1000), and each alone would have told the wrong story.
+    Report both, and never present the probe number as model accuracy.
+26. **Read your own design for forced behaviour.** `κ > 0` on every
+    coordinate meant every mode had to oscillate. No experiment was
+    needed to know there was no place for a static memory.
 22. **Diagnostics that back a recorded table belong in the repo.** The
     Big Bang script lived in a scratch directory; it is now
     `benchmarks/diagnostics/`.
@@ -218,6 +234,20 @@ hash instead of deleting them.
       bent geometry or particle state between sessions, possibly as a
       saved phase-state *cache* to resume from instead of textual
       compaction. Watch for drift and forgetting (continual-learning risks).
+- [ ] **Selection rule for the conserved momenta** (top priority; ARTICLE
+      §4.2). The cyclic momenta hold the first token perfectly at T=1000
+      but distractors drift them (~8% of a first token's impulse, biased).
+      Candidates, in order of physical cleanliness: (a) a content-derived
+      charge that scales each token's impulse on the cyclic coordinates
+      (zero charge = no coupling), the physics counterpart of an input
+      gate; (b) a readout invariant to a uniform shift of the cyclic
+      momenta; (c) training lengths up to 100+ so drift is penalised.
+      Pre-register: own-readout recall ≥ 0.9 at T=400 and ≥ LSTM at T=1000.
+- [ ] Give the particle model the same treatment: which of its
+      quantities are conserved, and does a probe find the first token
+      in them on the 40-token tasks where its own readout is at chance?
+- [ ] Does `ham_learned` holding `count`/`lag` to T=400 (transformer at
+      chance) survive a transformer with relative positions?
 - [ ] Param-matched LSTM with forget bias 3 (hidden 44) on all tasks.
 - [ ] Test the "discrete state needs attractors" reading of `count`, e.g.
       unbounded counting (no clipping) should want less γ than bounded.
