@@ -189,6 +189,11 @@ declared): accuracy ≥ 0.9 at T = 400 and at least the LSTM's at T = 1000
 predicted to fail like ``ham_charge``. Risk noted in advance: a first
 token whose charge dies early cannot recover (zero gradient).
 
+(Result: supported. Cost 0.1: 1.000 at every length to T = 10,000 on 5/5
+seeds, distractor charges exactly zero; cost 1.0: 0.963 at T = 1000; the
+cost-0 control fails (0.142); at cost 0.01 one seed fails, the risk
+noted above. Best of 13 LSTM settings: 0.948 +- 0.071 at T = 10,000.)
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now

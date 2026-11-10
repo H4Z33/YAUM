@@ -32,6 +32,23 @@ rewrite past entries. Newest session first.
 26. **Read your own design for forced behaviour.** `κ > 0` on every
     coordinate meant every mode had to oscillate. No experiment was
     needed to know there was no place for a static memory.
+27. **Small is not zero when the clock runs long.** Three penalties
+    (hypotheses 7–9) each shrank the leak into the conserved memory and
+    none helped, because 1000 tokens multiply any per-token bias by
+    1000. If a guarantee has to hold at unseen lengths, the mechanism
+    must be able to produce an exact zero (ReLU charge), not a small
+    number (sigmoid).
+28. **Diagnose the failure before the next fix.** The swap test (which
+    part of the state breaks the readout) and the transfer probe (drift
+    or noise?) each took minutes and each ruled out a plausible wrong
+    fix. Hypothesis 7 was launched without them and cost a run.
+29. **Re-tune the baseline for every new test.** LSTM forget bias 3 was
+    tuned for T = 40. At T = 10,000 forget bias 8 or lr 1e-2 lifts it
+    from 0.83 to 0.95. The bar moves with the question.
+30. **Look at how the task lets the model win.** `recall_first` draws
+    the first token and the distractors from different symbol sets, so
+    a per-token charge suffices by construction. State that next to the
+    result.
 22. **Diagnostics that back a recorded table belong in the repo.** The
     Big Bang script lived in a scratch directory; it is now
     `benchmarks/diagnostics/`.
@@ -234,15 +251,16 @@ hash instead of deleting them.
       bent geometry or particle state between sessions, possibly as a
       saved phase-state *cache* to resume from instead of textual
       compaction. Watch for drift and forgetting (continual-learning risks).
-- [ ] **Selection rule for the conserved momenta** (top priority; ARTICLE
-      §4.2). The cyclic momenta hold the first token perfectly at T=1000
-      but distractors drift them (~8% of a first token's impulse, biased).
-      Candidates, in order of physical cleanliness: (a) a content-derived
-      charge that scales each token's impulse on the cyclic coordinates
-      (zero charge = no coupling), the physics counterpart of an input
-      gate; (b) a readout invariant to a uniform shift of the cyclic
-      momenta; (c) training lengths up to 100+ so drift is penalised.
-      Pre-register: own-readout recall ≥ 0.9 at T=400 and ≥ LSTM at T=1000.
+- [x] **Selection rule for the conserved momenta**: done 2026-11-10
+      (`ham_neutral`: ReLU charge + L1 charge cost; ARTICLE §4.2).
+- [ ] **Generalise the selection rule** (top priority). (a) A task where
+      the item to store is marked by position or by an earlier token,
+      not by its symbol set: needs a state-dependent charge (e.g. a
+      charge that an already-written memory suppresses, an exclusion
+      principle). (b) `count`, `lag`, `assoc` with cyclic + neutral
+      coordinates mixed with ordinary ones. (c) Remove the cost sweep:
+      anneal the charge cost, or guard against dead first-token charges.
+      (d) More seeds (≥ 10) for the comparison with the best LSTM.
 - [ ] Give the particle model the same treatment: which of its
       quantities are conserved, and does a probe find the first token
       in them on the 40-token tasks where its own readout is at chance?

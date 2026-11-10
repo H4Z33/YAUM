@@ -241,3 +241,77 @@ the cyclic directions: first tokens 1.5–2.1 RMS, distractors 0.13–0.16
 RMS with a mean (drift per token) of 0.012–0.019. Over 1000 tokens the
 drift is ~7× the signal, which a fixed readout cannot follow and a
 re-fitted one can.
+
+## Run 2026-11-10: a selection rule for the conserved momenta (hypotheses 7–10). recall_first, steps=1500, hidden=64, n_cyclic=16, seeds=[0, 1, 2, 3, 4]
+
+Own readout, mean ± std over 5 seeds. Criteria for all four hypotheses:
+≥ 0.9 at T=400 and at least the LSTM's accuracy at T=1000.
+
+| hyp. | training lengths | model / setting | T=40 | T=100 | T=200 | T=400 | T=1000 |
+|---|---|---|---:|---:|---:|---:|---:|
+| – | 20–40 | `lstm` (forget bias 3) | 1.000 ± 0.000 | 1.000 ± 0.000 | 0.957 ± 0.061 | 0.928 ± 0.103 | 0.875 ± 0.084 |
+| – | 20–100 | `lstm` (forget bias 3) | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 0.983 ± 0.038 |
+| 7 | 20–40 | `ham_charge` (sigmoid charge) | 1.000 ± 0.000 | 0.809 ± 0.253 | 0.298 ± 0.228 | 0.145 ± 0.020 | 0.122 ± 0.005 |
+| 7 | 20–100 | `ham_charge` | 1.000 ± 0.000 | 1.000 ± 0.000 | 0.993 ± 0.014 | 0.630 ± 0.282 | 0.205 ± 0.057 |
+| 7 | 20–100 | `ham_cyclic_learned` | 1.000 ± 0.000 | 1.000 ± 0.000 | 0.999 ± 0.002 | 0.650 ± 0.276 | 0.248 ± 0.175 |
+| 8 | 20–40 | `ham_charge`, write cost 0.1 | 1.000 ± 0.000 | 0.997 ± 0.003 | 0.612 ± 0.337 | 0.324 ± 0.170 | 0.159 ± 0.051 |
+| 8 | 20–40 | `ham_charge`, write cost 1.0 | 1.000 ± 0.000 | 0.997 ± 0.007 | 0.810 ± 0.290 | 0.490 ± 0.215 | 0.215 ± 0.123 |
+| 8 | 20–40 | `ham_cyclic_learned`, write cost 0.1 | 1.000 ± 0.000 | 0.984 ± 0.023 | 0.618 ± 0.253 | 0.276 ± 0.150 | 0.171 ± 0.060 |
+| 8 | 20–40 | `ham_cyclic_learned`, write cost 1.0 | 0.982 ± 0.041 | 0.869 ± 0.293 | 0.728 ± 0.359 | 0.422 ± 0.183 | 0.204 ± 0.125 |
+| 9 | 20–40 | `ham_charge`, net-force penalty 10 | 1.000 ± 0.000 | 0.945 ± 0.093 | 0.614 ± 0.368 | 0.404 ± 0.262 | 0.137 ± 0.025 |
+| 9 | 20–40 | `ham_charge`, net-force penalty 100 | 1.000 ± 0.000 | 0.995 ± 0.011 | 0.801 ± 0.169 | 0.375 ± 0.205 | 0.163 ± 0.051 |
+| 9 | 20–40 | `ham_cyclic_learned`, net-force penalty 10 | 1.000 ± 0.000 | 0.971 ± 0.026 | 0.570 ± 0.213 | 0.320 ± 0.079 | 0.135 ± 0.009 |
+| 9 | 20–40 | `ham_cyclic_learned`, net-force penalty 100 | 1.000 ± 0.000 | 0.918 ± 0.083 | 0.532 ± 0.172 | 0.324 ± 0.114 | 0.227 ± 0.091 |
+| 10 | 20–40 | `ham_neutral` (ReLU charge), charge cost 0 (control) | 1.000 ± 0.000 | 0.747 ± 0.297 | 0.216 ± 0.127 | 0.154 ± 0.050 | 0.142 ± 0.048 |
+| 10 | 20–40 | `ham_neutral`, charge cost 0.01 | 0.975 ± 0.057 | 0.851 ± 0.332 | 0.822 ± 0.397 | 0.822 ± 0.399 | 0.819 ± 0.405 |
+| 10 | 20–40 | `ham_neutral`, charge cost 0.1 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | **1.000 ± 0.000** |
+| 10 | 20–40 | `ham_neutral`, charge cost 1.0 | 0.992 ± 0.018 | 0.979 ± 0.029 | 0.966 ± 0.054 | 0.964 ± 0.055 | 0.963 ± 0.058 |
+
+Hypotheses 7, 8 and 9 **not supported**. Hypothesis 10 **supported** at
+charge costs 0.1 and 1.0; the cost-0 control fails as predicted, and at
+0.01 one seed of five fails at every length (the risk noted in advance).
+
+Diagnostics behind the chain:
+
+* `benchmarks.diagnostics.readout_swap`: replacing only the conserved
+  part of the state with its long-run value breaks the readout; the
+  ordinary modes are harmless. Sigmoid charges never closed (distractor
+  charges 0.01–0.98).
+* `benchmarks.diagnostics.transfer_probe`: a readout fitted at T=40
+  fails at T=1000, and the same readout on re-centred features scores
+  1.000 (4/4 runs). The failure is a deterministic drift, i.e. the mean
+  distractor impulse; the random part is harmless.
+* `readout_swap ham_neutral 0 40 0.1`: charges of the 8 first-token
+  symbols 0.51–1.32, charges of the 8 distractor symbols all exactly
+  0.0, drift per token exactly 0.
+
+### Robustness: best LSTM setting, and 10,000 tokens
+
+All trained on lengths 20–40, 5 seeds, own readout. The LSTM gets 13
+settings; `ham_neutral` is the cost-0.1 setting from above (chosen on
+the same seeds at T ≤ 1000).
+
+| model | forget bias | lr | steps | T=40 | T=400 | T=1000 | T=4000 | T=10000 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ham_neutral` (cost 0.1) | – | 3e-3 | 1500 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | 1.000 ± 0.000 | **1.000 ± 0.000** |
+| `lstm` | 3 | 1e-3 | 1500 | 1.000 ± 0.000 | 0.935 ± 0.069 | 0.871 ± 0.102 | 0.841 ± 0.137 | 0.834 ± 0.132 |
+| `lstm` | 3 | 3e-3 | 1500 | 1.000 ± 0.000 | 0.928 ± 0.103 | 0.875 ± 0.084 | 0.835 ± 0.060 | 0.825 ± 0.070 |
+| `lstm` | 3 | 1e-2 | 1500 | 1.000 ± 0.000 | 0.972 ± 0.063 | 0.965 ± 0.054 | 0.950 ± 0.069 | 0.948 ± 0.071 |
+| `lstm` | 3 | 3e-3 | 6000 | 1.000 ± 0.000 | 0.926 ± 0.090 | 0.880 ± 0.088 | 0.858 ± 0.074 | 0.852 ± 0.077 |
+| `lstm` | 5 | 1e-3 | 1500 | 1.000 ± 0.000 | 0.996 ± 0.007 | 0.934 ± 0.066 | 0.857 ± 0.142 | 0.842 ± 0.162 |
+| `lstm` | 5 | 3e-3 | 1500 | 1.000 ± 0.000 | 0.943 ± 0.120 | 0.934 ± 0.109 | 0.903 ± 0.157 | 0.896 ± 0.173 |
+| `lstm` | 5 | 1e-2 | 1500 | 1.000 ± 0.000 | 0.976 ± 0.053 | 0.953 ± 0.059 | 0.911 ± 0.061 | 0.903 ± 0.055 |
+| `lstm` | 5 | 3e-3 | 6000 | 1.000 ± 0.000 | 0.961 ± 0.070 | 0.927 ± 0.107 | 0.876 ± 0.147 | 0.872 ± 0.158 |
+| `lstm` | 8 | 1e-3 | 1500 | 1.000 ± 0.000 | 1.000 ± 0.000 | 0.972 ± 0.063 | 0.952 ± 0.107 | 0.934 ± 0.112 |
+| `lstm` | 8 | 3e-3 | 1500 | 1.000 ± 0.000 | 0.972 ± 0.062 | 0.950 ± 0.112 | 0.948 ± 0.116 | 0.946 ± 0.120 |
+| `lstm` | 8 | 1e-2 | 1500 | 1.000 ± 0.000 | 0.981 ± 0.043 | 0.922 ± 0.175 | 0.928 ± 0.162 | 0.921 ± 0.178 |
+| `lstm` | 8 | 3e-3 | 6000 | 1.000 ± 0.000 | 0.994 ± 0.013 | 0.954 ± 0.104 | 0.947 ± 0.119 | 0.943 ± 0.126 |
+
+Reading it honestly: the best LSTM settings reach 0.95 at 10,000 tokens
+with a seed spread of 0.07–0.12, so on mean ± std the gap to 1.000 is
+about one LSTM standard deviation (5 seeds). What differs in kind is
+that `ham_neutral` is exact on every seed at every length, because
+nothing touches the memory after the write. Limits: one task; the first
+token and the distractors come from different symbol sets, so a
+per-token charge is sufficient here by construction; the charge cost
+needed a sweep (0.01 loses a seed).

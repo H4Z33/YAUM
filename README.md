@@ -51,8 +51,12 @@ results — including the ones that did not go the project's way.
   coordinates symmetric (cyclic) gives exactly conserved momenta
   (Noether): the first token is then perfectly recoverable from the
   state at 1000 tokens (fresh linear readout 1.000 on 10/10 runs; LSTM
-  0.90), but the model's own readout still fails by 400 tokens, where
-  the LSTM scores 0.93. See `docs/ARTICLE.md` §4.2.
+  0.90). For the model to use that memory itself, tokens must be able to
+  be exactly *neutral* (a ReLU charge on the conserved coordinates):
+  trained on 20–40 tokens, recall is then 1.000 at 10,000 tokens on 5/5
+  seeds, where the best of 13 LSTM settings scores 0.95 ± 0.07. One task
+  so far, and one where a per-token charge is enough by construction.
+  See `docs/ARTICLE.md` §4.2.
 
 ## Key features
 

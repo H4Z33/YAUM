@@ -20,7 +20,7 @@ The physics lives in two places, and keeping them apart is essential:
 | clock | optimiser steps | tokens read |
 | what moves | embedding table `E` (with momentum `P`, mass `m`) | hidden state `(q, p)` |
 | code | `yaum/core/` (trainer, integrators) | `yaum/models/hamiltonian.py` |
-| status | works; ties a tuned Adam on `E` | learns memory, learned friction is informative; a fair LSTM still matches or beats it; many-body model learns binding slowly (§4.1); cyclic coordinates give a conserved memory that survives 1000 tokens but the model can't yet read it (§4.2) |
+| status | works; ties a tuned Adam on `E` | learns memory, learned friction is informative; a fair LSTM still matches or beats it; many-body model learns binding slowly (§4.1); cyclic coordinates + neutral tokens (ReLU charge) give exact recall at 10,000 tokens after training on 20–40, where the best LSTM setting gets 0.95; one task only so far (§4.2) |
 
 The owner's thesis is mostly about **context time** ("a model builds a
 small universe that moves with context as time"). Training-time physics

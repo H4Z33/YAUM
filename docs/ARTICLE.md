@@ -373,6 +373,52 @@ gate). Note the honest reading: this shows a conservation law protects
 information better than a learned gate does, not that the model is
 better; and "a fresh readout per length" is a probe, not a usable model.
 
+**Finding the selection rule took four attempts** (hypotheses 7–10, all
+pre-registered; results file, 2026-11-10). Each failure narrowed the
+cause:
+
+| attempt | idea | recall at T = 400 (trained on 20–40) |
+|---|---|---:|
+| 7 | a learned charge in (0, 1) scales each token's push on the conserved coordinates | 0.145 |
+| 8 | the same, plus a cost on every write | 0.49 at best |
+| 9 | a cost on the *mean* push only (the measured cause: a fixed readout re-centred scores 1.000 at T = 1000) | 0.32–0.40 |
+| 10 | a charge that can be **exactly zero** (ReLU), plus a cost per charged token | **1.000** |
+
+The first three made the leak smaller, never zero, and over 1000 tokens
+a leak must be below ~1e-4 of a write to be harmless. A sigmoid cannot
+reach zero; a ReLU can. With it the model learns *neutral* tokens:
+charge 0.5–1.3 for the eight symbols worth remembering and exactly 0.0
+for the eight distractors. A neutral token cannot move a conserved
+momentum (there is a test for this), so after the write nothing touches
+the memory at any length.
+
+| trained on 20–40 tokens, own readout, 5 seeds | T = 1000 | T = 10,000 |
+|---|---:|---:|
+| `ham_neutral` (charge cost 0.1) | **1.000 ± 0.000** | **1.000 ± 0.000** |
+| LSTM, forget bias 3 (the setting used so far) | 0.875 ± 0.084 | 0.825 ± 0.070 |
+| LSTM, best of 13 settings (forget bias 3/5/8 × lr × steps) | 0.972 ± 0.063 | 0.948 ± 0.071 |
+
+This is the first end-to-end result where the physics does something a
+tuned standard model does not: recall at 250× the training length is
+exact on every seed, because of a conservation law plus a selection
+rule, not because of a longer training budget. What it does **not**
+show:
+
+* The margin over the best LSTM is about one LSTM standard deviation on
+  five seeds. The difference in kind (exact on all seeds vs 0.95 with
+  some seeds degrading) is the claim, not the mean.
+* One task. Its first token and its distractors come from different
+  symbol sets, so a charge that depends only on the current token is
+  enough by construction. A task where the same symbol must be stored
+  once and ignored later needs a charge that depends on the state.
+* The charge cost needed a sweep: with no cost the model fails like its
+  predecessors, at 0.01 one seed in five never learns to write.
+* A conserved memory cannot be overwritten or forgotten. That is the
+  price of the guarantee, and real use needs both kinds of coordinate.
+* Training an LSTM on lengths 20–100 also fixes its T = 1000 recall
+  (0.983). The Hamiltonian model gets there without seeing long
+  sequences.
+
 ---
 
 ## 5. Related work worth reading
@@ -409,6 +455,8 @@ better; and "a fresh readout per length" is a probe, not a usable model.
 | (diagnostic, 3 seeds, embedding 32) "dense-born particles solve `assoc` (0.81, two seeds ≈ 0.99), above the LSTM" | Not confirmed by the pre-registered 5-seed run at embedding 16: 0.571 ± 0.206 vs LSTM 0.678. |
 | (pre-registered) "the conservative model keeps recall ≥ 0.9 at 10× the training length and degrades less than the LSTM" | Not supported: chance by T = 100. The memory is a rotating phase the readout cannot follow (§4.2). |
 | (pre-registered) "with cyclic coordinates the model's own recall is ≥ 0.9 at T = 400" | Not supported (0.18–0.35). The state still holds the token perfectly at T = 1000 (fresh readout 1.000 on 10/10 runs vs LSTM 0.90), but distractors drift the conserved momentum and the trained readout cannot follow. |
+| (pre-registered, three times) "a soft charge / a write cost / a net-force penalty lets the model read its conserved memory at T = 400" | Not supported (0.15–0.49). Each shrank the per-token leak without making it zero. A charge that can be exactly zero (hypothesis 10) was needed: 1.000 to T = 10,000. |
+| "LSTM 0.875 at T = 1000" as the bar for long recall | Under-tuned for this test. Forget bias 8 or lr 1e-2 gives 0.95–0.97 at T = 1000 and 0.95 at T = 10,000. Comparisons now quote the best of 13 settings. |
 | "On `assoc` the LSTM leads clearly (0.69)" as the bar; "dense birth is bimodal: a seed finds the binding solution or stalls near 0.5" | Both are artefacts of the 1500-step budget. At 6000 steps the LSTM reaches 0.99 and the "stalled" dense seeds reach 0.79–1.00 (they were slow, not stuck). A small transformer, never benchmarked before, scores 1.000 at 1500 steps on all seeds and is the real bar. See the 2026-11-10 audit diagnostic in the results file. |
 
 ---
