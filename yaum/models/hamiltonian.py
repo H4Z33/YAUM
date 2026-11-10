@@ -109,7 +109,7 @@ class HamiltonianCharModel(nn.Module):
         stiffness_init: float = 1.0,
         geometry_mass_init: float = 1.0,
         n_cyclic: int = 0,
-        cyclic_charge: bool = False,
+        cyclic_charge: bool | str = False,
     ):
         super().__init__()
         if n_layers < 1:
@@ -154,9 +154,19 @@ class HamiltonianCharModel(nn.Module):
         # (ARTICLE §4.2). This plays the role of an LSTM input gate; the
         # difference is that the memory it guards is conserved exactly by
         # a symmetry instead of approximately by a learned forget gate.
+        # ``"neutral"`` uses g(x) = relu(w·x + b) instead of a sigmoid, so
+        # a token's charge can be *exactly* zero (a neutral token). Smooth
+        # charges and penalties only make the leak small, and a small leak
+        # times 1000 tokens still exceeds the signal (hypotheses 7–9).
         if cyclic_charge and not self.n_cyclic:
             raise ValueError("cyclic_charge needs n_cyclic > 0")
+        if cyclic_charge not in (False, True, "sigmoid", "neutral"):
+            raise ValueError("cyclic_charge must be False, True, 'sigmoid' or 'neutral'")
+        self.charge_kind = "sigmoid" if cyclic_charge is True else cyclic_charge
         self.cyclic_charge = nn.Linear(embedding_dim, 1) if cyclic_charge else None
+        if self.charge_kind == "neutral":
+            nn.init.constant_(self.cyclic_charge.bias, 1.0)  # start charged: a dead gate cannot recover
+        self.last_charge_mean = None
 
         if dissipation == "learned":
             self._rho = nn.Parameter(
@@ -318,7 +328,9 @@ class HamiltonianCharModel(nn.Module):
             q, p = hidden
         kicks = self.impulse(embedded)  # (B, T, h)
         if self.cyclic_charge is not None:
-            charge = torch.sigmoid(self.cyclic_charge(embedded))  # (B, T, 1)
+            raw = self.cyclic_charge(embedded)  # (B, T, 1)
+            charge = torch.relu(raw) if self.charge_kind == "neutral" else torch.sigmoid(raw)
+            self.last_charge_mean = charge.mean()
             kicks = kicks * (self._active + (1.0 - self._active) * charge)
         # Mean squared impulse on the conserved coordinates in this call: a
         # training loop may add it to the loss as a "write cost", so that

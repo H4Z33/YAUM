@@ -281,3 +281,19 @@ def test_zero_charge_tokens_cannot_change_the_conserved_momenta():
         assert float(p_on[:, -3:].abs().max()) > 1e-3
     with pytest.raises(ValueError):
         HamiltonianCharModel(7, 5, 8, 2, cyclic_charge=True)
+
+
+def test_neutral_tokens_have_exactly_zero_charge():
+    torch.manual_seed(0)
+    model = HamiltonianCharModel(7, 5, 8, 2, n_cyclic=3, cyclic_charge="neutral")
+    x = torch.randn(2, 30, 5)
+    with torch.no_grad():
+        model(x, None)
+        assert float(model.last_charge_mean) > 0  # starts charged
+        model.cyclic_charge.weight.zero_()
+        model.cyclic_charge.bias.fill_(-0.1)  # slightly negative is enough: relu gives exactly 0
+        _, (_, p) = model(x, None)
+        assert float(p[:, -3:].abs().max()) == 0.0
+        assert float(model.last_charge_mean) == 0.0
+    with pytest.raises(ValueError):
+        HamiltonianCharModel(7, 5, 8, 2, n_cyclic=3, cyclic_charge="hard")

@@ -11,7 +11,8 @@ learned energy as tokens arrive):
                        momenta are exactly conserved (Noether);
                        ham_cyclic_learned adds learned friction elsewhere;
                        ham_charge adds a selection rule (a content-derived
-                       charge gating what may change the conserved momenta)
+                       charge gating what may change the conserved momenta);
+                       ham_neutral uses a charge that can be exactly zero
     ham_learned        per-mode friction γ_i learned with the weights
     ham_geometry       ham_learned + dynamic geometry: the landscape is
                        bent by the content as it is read (joint
@@ -172,6 +173,22 @@ first-token mean vanish separately. Same criteria as hypotheses 7 and 8,
 declared): accuracy ≥ 0.9 at T = 400 and at least the LSTM's at T = 1000
 (0.875 ± 0.084).
 
+(Result: not supported; 0.32–0.40 at T = 400 at both strengths.)
+
+Tenth pre-registered hypothesis (written 2026-11-10, before any model
+with a ReLU charge had been trained). Three penalties (hypotheses 7–9)
+each made the leak smaller and none made it small enough: over 1000
+tokens a per-token drift must be below ~1e-4 of a write, and a sigmoid
+charge or a batch-mean estimate cannot get there. ``ham_neutral`` is
+``ham_charge`` with charge g(x) = relu(w·x + b), which can be exactly
+zero, plus an L1 cost on the charge (``--cyclic-charge-cost``) that pays
+for every charged token. Same criteria, ``recall_first``, trained on
+20–40, 5 seeds, own readout, at cost 0 (control), 0.01, 0.1 and 1.0 (all
+declared): accuracy ≥ 0.9 at T = 400 and at least the LSTM's at T = 1000
+(0.875 ± 0.084) for at least one non-zero cost; the control at cost 0 is
+predicted to fail like ``ham_charge``. Risk noted in advance: a first
+token whose charge dies early cannot recover (zero gradient).
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now
@@ -321,12 +338,12 @@ def build(name: str, args) -> Wrapped:
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none",
         )
-    elif name in ("ham_cyclic", "ham_cyclic_learned", "ham_charge"):
+    elif name in ("ham_cyclic", "ham_cyclic_learned", "ham_charge", "ham_neutral"):
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none" if name == "ham_cyclic" else "learned",
             gamma_init=args.gamma_init, n_cyclic=args.n_cyclic,
-            cyclic_charge=name == "ham_charge",
+            cyclic_charge={"ham_charge": True, "ham_neutral": "neutral"}.get(name, False),
         )
     elif name in ("ham_learned", "ham_geometry"):
         core = HamiltonianCharModel(
@@ -401,6 +418,9 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
         write = getattr(model.core, "last_cyclic_write", None)
         if args.cyclic_write_cost and write is not None:
             loss = loss + args.cyclic_write_cost * write
+        charge_mean = getattr(model.core, "last_charge_mean", None)
+        if args.cyclic_charge_cost and charge_mean is not None:
+            loss = loss + args.cyclic_charge_cost * charge_mean
         net = getattr(model.core, "last_cyclic_net_force", None)
         if args.cyclic_net_force and net is not None:
             loss = loss + args.cyclic_net_force * net
@@ -466,7 +486,8 @@ def report(results: list[Result], args) -> str:
             f"lstm_forget_bias={args.lstm_forget_bias}"
             + (f" train_len={args.train_len_min}-{args.train_len_max or args.seq_len}" if args.train_len_min else "")
             + (f" cyclic_write_cost={args.cyclic_write_cost}" if args.cyclic_write_cost else "")
-            + (f" cyclic_net_force={args.cyclic_net_force}" if args.cyclic_net_force else "") + "\n"
+            + (f" cyclic_net_force={args.cyclic_net_force}" if args.cyclic_net_force else "")
+            + (f" cyclic_charge_cost={args.cyclic_charge_cost}" if args.cyclic_charge_cost else "") + "\n"
         ),
         ("| task | model | accuracy | params | learned γ median (90th pct) "
         "| geometry γ / stiffness λ | wall (s) |"),
@@ -542,7 +563,8 @@ def _float_or_none(text: str):
 
 MODELS = (
     "lstm", "transformer", "ham_conservative", "ham_learned", "ham_geometry",
-    "ham_cyclic", "ham_cyclic_learned", "ham_charge", "particles", "particles_dense",
+    "ham_cyclic", "ham_cyclic_learned", "ham_charge", "ham_neutral",
+    "particles", "particles_dense",
 )
 # The particle models cost O(T³) per sequence (tens of minutes per run at
 # T = 40 on CPU), so they are opt-in via --models.
@@ -578,6 +600,8 @@ def main() -> None:
                         help="if > 0, draw each training batch's length from [this, --seq-len]")
     parser.add_argument("--cyclic-write-cost", type=float, default=0.0,
                         help="weight of the mean squared impulse on conserved coordinates in the loss")
+    parser.add_argument("--cyclic-charge-cost", type=float, default=0.0,
+                        help="weight of the mean charge (L1) in the loss; with ham_neutral it makes tokens neutral")
     parser.add_argument("--cyclic-net-force", type=float, default=0.0,
                         help="weight of |mean impulse on conserved coordinates|^2 in the loss")
     parser.add_argument("--train-len-max", type=int, default=0,
