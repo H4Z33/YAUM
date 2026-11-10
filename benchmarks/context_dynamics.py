@@ -397,6 +397,22 @@ def masked_loss_acc(logits, y, mask):
     return loss, acc
 
 
+def chunked_accuracy(model, x, y, mask, max_tokens: int = 40_000) -> float:
+    """Masked accuracy, evaluated in chunks so long sequences fit in memory.
+
+    Every model returns logits for all positions, so 1024 sequences of
+    10 000 tokens at once needs several GB.
+    """
+    chunk = max(1, max_tokens // x.shape[1])
+    correct, total = 0.0, 0
+    for i in range(0, x.shape[0], chunk):
+        m = mask[i:i + chunk]
+        logits = model(x[i:i + chunk])
+        correct += float((logits.argmax(-1)[m] == y[i:i + chunk][m]).sum())
+        total += int(m.sum())
+    return correct / max(total, 1)
+
+
 def run(task: str, model_name: str, seed: int, args) -> Result:
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(seed + 1000)
@@ -446,8 +462,7 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
         _, acc = masked_loss_acc(model(x), y, mask)
         for length in args.eval_lengths:
             xl, yl, ml = make(1024, length, torch.Generator().manual_seed(30_000 + seed + length))
-            _, acc_l = masked_loss_acc(model(xl), yl, ml)
-            length_acc[length] = float(acc_l)
+            length_acc[length] = chunked_accuracy(model, xl, yl, ml)
     result = Result(
         task=task,
         model=model_name,
