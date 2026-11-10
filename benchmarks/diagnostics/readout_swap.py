@@ -15,7 +15,7 @@ them between a long run and its own 40-token prefix (same first token):
 If ``cons=long`` stays high and ``rest=long`` collapses, the conserved
 memory is fine and the ordinary modes are what derail the readout.
 
-Usage: python -m benchmarks.diagnostics.readout_swap MODEL SEED [TRAIN_LEN_MAX]
+Usage: python -m benchmarks.diagnostics.readout_swap MODEL SEED [TRAIN_LEN_MAX] [CHARGE_COST]
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from benchmarks.context_dynamics import N_SYMBOLS, TASKS, build, masked_loss_acc
 torch.set_num_threads(1)
 name, seed = sys.argv[1], int(sys.argv[2])
 top = int(sys.argv[3]) if len(sys.argv) > 3 else 40
+charge_cost = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
 args = SimpleNamespace(embedding_dim=16, hidden_dim=64, particle_dim=32, substeps=2, charge_dim=16,
                        dt=0.5, gamma_init=0.05, lstm_forget_bias=3.0, n_cyclic=16)
 torch.manual_seed(seed)
@@ -41,6 +42,8 @@ for _ in range(1500):
     length = int(torch.randint(20, top + 1, (1,), generator=gen))
     x, y, mask = make(64, length, gen)
     loss, _ = masked_loss_acc(model(x), y, mask)
+    if charge_cost:
+        loss = loss + charge_cost * core.last_charge_mean
     opt.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -53,7 +56,8 @@ with torch.no_grad():
     emb = model.embed.weight
     kick = core.impulse(emb)[:, -nc:]
     if core.cyclic_charge is not None:
-        g = torch.sigmoid(core.cyclic_charge(emb)).squeeze(-1)
+        raw = core.cyclic_charge(emb).squeeze(-1)
+        g = torch.relu(raw) if core.charge_kind == "neutral" else torch.sigmoid(raw)
         kick = kick * g.unsqueeze(-1)
         print(f"{name} seed={seed} charge: first tokens {[round(float(v), 3) for v in g[:N_SYMBOLS]]}")
         print(f"{'':{len(name)}}        charge: distractors  {[round(float(v), 3) for v in g[N_SYMBOLS:]]}")
