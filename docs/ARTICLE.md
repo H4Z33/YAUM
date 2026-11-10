@@ -355,6 +355,7 @@ the binding solution or stalls near 0.5).
 | (first context-time run) "Hamiltonian models solve long recall where the LSTM stays at chance" | Artefact of PyTorch's LSTM forget-gate init. With forget bias 3 the LSTM solves it too, and it matches or beats the Hamiltonian models on every task. |
 | (pre-registered) "the many-body model beats single-particle models on `assoc` and is at least as good on recall/count" | Not supported: a noisy tie on `assoc` (0.39 ± 0.23), chance on recall, count and lag. |
 | (diagnostic, 3 seeds, embedding 32) "dense-born particles solve `assoc` (0.81, two seeds ≈ 0.99), above the LSTM" | Not confirmed by the pre-registered 5-seed run at embedding 16: 0.571 ± 0.206 vs LSTM 0.678. |
+| "On `assoc` the LSTM leads clearly (0.69)" as the bar; "dense birth is bimodal: a seed finds the binding solution or stalls near 0.5" | Both are artefacts of the 1500-step budget. At 6000 steps the LSTM reaches 0.99 and the "stalled" dense seeds reach 0.79–1.00 (they were slow, not stuck). A small transformer, never benchmarked before, scores 1.000 at 1500 steps on all seeds and is the real bar. See the 2026-11-10 audit diagnostic in the results file. |
 
 ---
 

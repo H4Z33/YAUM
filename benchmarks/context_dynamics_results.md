@@ -147,3 +147,24 @@ the first 100 steps (clipped to 1.0 for the update).
 
 With expansion allowed, learned κ went *negative* on recall (−0.03,
 expanding) and back *positive* on assoc (+0.10, confining).
+
+### Audit diagnostic 2026-11-10 (not a benchmark): `assoc` budget and a transformer baseline
+
+`python -m benchmarks.diagnostics.assoc_audit MODEL SEED STEPS`, benchmark
+settings (embedding 16, lr 3e-3, batch 64), evaluated on 4096 sequences.
+
+| model | params | steps | accuracy per seed |
+|---|---:|---:|---|
+| transformer (2 layers, 2 heads) | 6,984 | 1500 | 1.000, 1.000, 1.000 (seeds 0–2) |
+| lstm | 21,768 | 1500 | 0.704 (seed 0) |
+| lstm | 21,768 | 6000 | 0.991, 0.990 (seeds 0, 1) |
+| particles_dense | 2,652 | 1500 | 0.525, 0.929, 0.503 (seeds 0–2) |
+| particles_dense | 2,652 | 6000 | 1.000, 0.859, 0.785 (seeds 0, 2, 3) |
+| particles (sparse birth) | 2,652 | 6000 | 0.649 (seed 2; 0.127 at 1500) |
+
+Reading: at 1500 steps `assoc` measures learning *speed*, not ability.
+The LSTM's 0.69 is an under-trained number (0.99 at 6000 steps), and the
+seeds of `particles_dense` that looked "stalled near 0.5" were still
+learning (their errors are spread evenly over the four pairs, and they
+reach 0.79–1.00 at 6000 steps). The bar on this task is the transformer:
+1.000 in 1500 steps on every seed.

@@ -5,6 +5,23 @@ rewrite past entries. Newest session first.
 
 ---
 
+## Session 2026-11-10 — second audit
+
+20. **A fixed step budget turns "slow" into "can't".** Every `assoc`
+    number in the article was read as ability. At 4× the steps the LSTM
+    goes 0.69 → 0.99 and the "stalled" dense-birth seeds go 0.5 → 0.79–1.00.
+    Plot (or at least sample) the learning curve and run one longer
+    budget before describing a model as stuck, bimodal or unable.
+21. **Benchmark the mechanism you compare yourself to.** The particle
+    model was described as "a cousin of attention" for two days without
+    a transformer in the table. It solves `assoc` in 1500 steps on every
+    seed with 7k parameters.
+22. **Diagnostics that back a recorded table belong in the repo.** The
+    Big Bang script lived in a scratch directory; it is now
+    `benchmarks/diagnostics/`.
+
+---
+
 ## Session 2026-11-09 — many-body particle model
 
 14. **Bound the strengths, floor the ranges.** The first particle draft
