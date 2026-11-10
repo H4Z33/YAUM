@@ -21,10 +21,15 @@ For each length the script reports:
            token (1.0 = each true token always maps to one answer, even if
            it is the wrong one; 1/8 = unrelated)
 
+The probe reads the raw state (before the readout's LayerNorm, when the
+model has one). Set ``TRAIN_LEN_MIN=20`` in the environment to train on
+lengths drawn from 20-40 instead of exactly 40.
+
 Usage: python -m benchmarks.diagnostics.memory_probe MODEL SEED [LENGTHS...]
 """
 from __future__ import annotations
 
+import os
 import sys
 from types import SimpleNamespace
 
@@ -36,14 +41,16 @@ torch.set_num_threads(1)
 name, seed = sys.argv[1], int(sys.argv[2])
 lengths = [int(v) for v in sys.argv[3:]] or [40, 44, 100, 200, 400, 1000]
 args = SimpleNamespace(embedding_dim=16, hidden_dim=64, particle_dim=32, substeps=2, charge_dim=16,
-                       dt=0.5, gamma_init=0.05, lstm_forget_bias=3.0)
+                       dt=0.5, gamma_init=0.05, lstm_forget_bias=3.0, n_cyclic=16)
+train_len_min = int(os.environ.get("TRAIN_LEN_MIN", "0"))
 torch.manual_seed(seed)
 gen = torch.Generator().manual_seed(seed + 1000)
 model = build(name, args)
 opt = torch.optim.Adam(model.parameters(), lr=3e-3)
 make = TASKS["recall_first"]
 for _ in range(1500):
-    x, y, mask = make(64, 40, gen)
+    train_len = int(torch.randint(train_len_min, 41, (1,), generator=gen)) if train_len_min else 40
+    x, y, mask = make(64, train_len, gen)
     loss, _ = masked_loss_acc(model(x), y, mask)
     opt.zero_grad(set_to_none=True)
     loss.backward()
@@ -52,7 +59,7 @@ for _ in range(1500):
 model.eval()
 
 captured = {}
-model.core.fc.register_forward_pre_hook(lambda _m, inp: captured.__setitem__("f", inp[0][:, -1]))
+getattr(model.core, "readout_norm", model.core.fc).register_forward_pre_hook(lambda _m, inp: captured.__setitem__("f", inp[0][:, -1]))
 
 
 def features(n, length, g):
