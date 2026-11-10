@@ -153,6 +153,25 @@ zero. Same criteria as hypothesis 7, ``recall_first``, trained on 20–40,
 λ = 0.1 and λ = 1.0 (both declared here; report both): accuracy ≥ 0.9 at
 T = 400 and at least the LSTM's at T = 1000 (0.875 ± 0.084).
 
+(Result: not supported, though in the right direction: at λ = 1.0
+``ham_charge`` reaches 0.490 ± 0.215 at T = 400, from 0.145.)
+
+Ninth pre-registered hypothesis (written 2026-11-10, before any run with
+a net-force penalty). ``benchmarks/diagnostics/transfer_probe.py`` shows
+the failure is entirely a *deterministic drift*: a readout fitted once at
+T = 40 fails at long lengths, but the same readout on re-centred features
+scores 1.000 at T = 1000 (4/4 runs). The random part of the distractor
+impulses is harmless; their mean is not. So penalise only the mean:
+``--cyclic-net-force μ`` adds ``μ · |mean impulse on the conserved
+coordinates|²`` (mean over the batch and time) to the loss. Individual
+writes stay free. Because training batches have different lengths, the
+mean can only vanish for all of them if the distractor mean and the
+first-token mean vanish separately. Same criteria as hypotheses 7 and 8,
+``recall_first``, trained on 20–40, 5 seeds, own readout, for
+``ham_cyclic_learned`` and ``ham_charge`` at μ = 10 and μ = 100 (both
+declared): accuracy ≥ 0.9 at T = 400 and at least the LSTM's at T = 1000
+(0.875 ± 0.084).
+
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
 diagnostic in the results file). ``--eval-every N --target A`` now
@@ -382,6 +401,9 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
         write = getattr(model.core, "last_cyclic_write", None)
         if args.cyclic_write_cost and write is not None:
             loss = loss + args.cyclic_write_cost * write
+        net = getattr(model.core, "last_cyclic_net_force", None)
+        if args.cyclic_net_force and net is not None:
+            loss = loss + args.cyclic_net_force * net
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -443,7 +465,8 @@ def report(results: list[Result], args) -> str:
             f"substeps={args.substeps} dt={args.dt} seeds={list(args.seeds)} "
             f"lstm_forget_bias={args.lstm_forget_bias}"
             + (f" train_len={args.train_len_min}-{args.train_len_max or args.seq_len}" if args.train_len_min else "")
-            + (f" cyclic_write_cost={args.cyclic_write_cost}" if args.cyclic_write_cost else "") + "\n"
+            + (f" cyclic_write_cost={args.cyclic_write_cost}" if args.cyclic_write_cost else "")
+            + (f" cyclic_net_force={args.cyclic_net_force}" if args.cyclic_net_force else "") + "\n"
         ),
         ("| task | model | accuracy | params | learned γ median (90th pct) "
         "| geometry γ / stiffness λ | wall (s) |"),
@@ -555,6 +578,8 @@ def main() -> None:
                         help="if > 0, draw each training batch's length from [this, --seq-len]")
     parser.add_argument("--cyclic-write-cost", type=float, default=0.0,
                         help="weight of the mean squared impulse on conserved coordinates in the loss")
+    parser.add_argument("--cyclic-net-force", type=float, default=0.0,
+                        help="weight of |mean impulse on conserved coordinates|^2 in the loss")
     parser.add_argument("--train-len-max", type=int, default=0,
                         help="upper end of the training-length range (default: --seq-len)")
     parser.add_argument("--eval-every", type=int, default=0,

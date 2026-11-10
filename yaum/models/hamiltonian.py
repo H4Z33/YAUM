@@ -327,6 +327,15 @@ class HamiltonianCharModel(nn.Module):
         self.last_cyclic_write = (
             kicks[..., -self.n_cyclic:].pow(2).mean() if self.n_cyclic else None
         )
+        # Squared norm of the *mean* impulse on the conserved coordinates
+        # (mean over batch and time). Zero means the token stream exerts no
+        # net force on them: individual writes can be large, but the
+        # conserved momenta do not drift. A steady drift, not the random
+        # part of the kicks, is what defeats a fixed readout at long
+        # lengths (benchmarks/diagnostics/transfer_probe.py).
+        self.last_cyclic_net_force = (
+            kicks[..., -self.n_cyclic:].mean(dim=(0, 1)).pow(2).sum() if self.n_cyclic else None
+        )
         outputs = []
         for t in range(seq_len):
             p = p + kicks[:, t]
