@@ -265,3 +265,19 @@ def test_cyclic_momenta_are_exactly_conserved_and_default_is_unchanged():
     assert plain.n_cyclic == 0 and bool((plain.kappa > 0).all())
     with pytest.raises(ValueError):
         HamiltonianCharModel(7, 5, 8, 2, n_cyclic=8)
+
+
+def test_zero_charge_tokens_cannot_change_the_conserved_momenta():
+    torch.manual_seed(0)
+    model = HamiltonianCharModel(7, 5, 8, 2, dissipation="learned", n_cyclic=3, cyclic_charge=True)
+    with torch.no_grad():
+        model.cyclic_charge.weight.zero_()
+        model.cyclic_charge.bias.fill_(-50.0)  # charge ≈ 0 for every token
+        _, (_, p) = model(torch.randn(2, 30, 5), None)
+        assert float(p[:, -3:].abs().max()) < 1e-12
+        assert float(p[:, :-3].abs().max()) > 1e-3  # ordinary modes still driven
+        model.cyclic_charge.bias.fill_(50.0)  # charge ≈ 1: behaves like no gate
+        _, (_, p_on) = model(torch.randn(2, 30, 5), None)
+        assert float(p_on[:, -3:].abs().max()) > 1e-3
+    with pytest.raises(ValueError):
+        HamiltonianCharModel(7, 5, 8, 2, cyclic_charge=True)

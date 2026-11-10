@@ -109,6 +109,7 @@ class HamiltonianCharModel(nn.Module):
         stiffness_init: float = 1.0,
         geometry_mass_init: float = 1.0,
         n_cyclic: int = 0,
+        cyclic_charge: bool = False,
     ):
         super().__init__()
         if n_layers < 1:
@@ -145,6 +146,17 @@ class HamiltonianCharModel(nn.Module):
         self.register_buffer("_active", active, persistent=False)
 
         self.impulse = nn.Linear(embedding_dim, hidden_dim, bias=False)
+        # Selection rule: a content-derived charge g(x) in (0, 1) scales
+        # each token's impulse on the cyclic coordinates. A token with zero
+        # charge cannot change the conserved momenta at all. Without it,
+        # distractor tokens push the conserved memory by ~8% of a real
+        # write each step, and the drift swamps it over hundreds of tokens
+        # (ARTICLE §4.2). This plays the role of an LSTM input gate; the
+        # difference is that the memory it guards is conserved exactly by
+        # a symmetry instead of approximately by a learned forget gate.
+        if cyclic_charge and not self.n_cyclic:
+            raise ValueError("cyclic_charge needs n_cyclic > 0")
+        self.cyclic_charge = nn.Linear(embedding_dim, 1) if cyclic_charge else None
 
         if dissipation == "learned":
             self._rho = nn.Parameter(
@@ -305,6 +317,9 @@ class HamiltonianCharModel(nn.Module):
         else:
             q, p = hidden
         kicks = self.impulse(embedded)  # (B, T, h)
+        if self.cyclic_charge is not None:
+            charge = torch.sigmoid(self.cyclic_charge(embedded))  # (B, T, 1)
+            kicks = kicks * (self._active + (1.0 - self._active) * charge)
         outputs = []
         for t in range(seq_len):
             p = p + kicks[:, t]

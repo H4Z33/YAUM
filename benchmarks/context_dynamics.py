@@ -9,7 +9,9 @@ learned energy as tokens arrive):
                        mechanism the particle model is compared to)
     ham_cyclic         ham_conservative with 16 cyclic coordinates whose
                        momenta are exactly conserved (Noether);
-                       ham_cyclic_learned adds learned friction elsewhere
+                       ham_cyclic_learned adds learned friction elsewhere;
+                       ham_charge adds a selection rule (a content-derived
+                       charge gating what may change the conserved momenta)
     ham_learned        per-mode friction γ_i learned with the weights
     ham_geometry       ham_learned + dynamic geometry: the landscape is
                        bent by the content as it is read (joint
@@ -119,6 +121,22 @@ conserved, a memory that does not rotate. ``ham_cyclic`` is
 If neither holds, a conserved momentum is not enough: the distractor
 impulses would be the first suspect (they add to the conserved momentum
 unless the model learns to zero them).
+
+(Result: not supported as stated; own readout 0.18–0.35 at T = 400. But a
+fresh linear readout recovers the token perfectly at T = 1000 on 10/10
+runs, against 0.90 for the LSTM: the memory is conserved and the model
+cannot read it, because distractor impulses drift the conserved momenta.)
+
+Seventh pre-registered hypothesis (written 2026-11-10, before any model
+with a cyclic charge had been trained). ``ham_charge`` is
+``ham_cyclic_learned`` plus a selection rule: a content-derived charge
+g(x) ∈ (0, 1) scales each token's impulse on the cyclic coordinates.
+Prediction, ``recall_first``, trained on lengths 20–40, 5 seeds, the
+model's *own* readout: accuracy ≥ 0.9 at T = 400, and at T = 1000 at
+least the LSTM's under the same training (0.875 ± 0.084). If the charge
+does not saturate for distractors (training at ≤ 40 tokens gives little
+pressure to), the fallback condition is training lengths 20–100; report
+both, and report the learned charges per token class.
 
 Measuring-stick change (2026-11-10): accuracy after a fixed 1500 steps
 turned out to measure learning *speed* on ``assoc`` (see the audit
@@ -269,11 +287,12 @@ def build(name: str, args) -> Wrapped:
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none",
         )
-    elif name in ("ham_cyclic", "ham_cyclic_learned"):
+    elif name in ("ham_cyclic", "ham_cyclic_learned", "ham_charge"):
         core = HamiltonianCharModel(
             N_SYMBOLS, args.embedding_dim, args.hidden_dim, args.substeps,
             dt=args.dt, dissipation="none" if name == "ham_cyclic" else "learned",
             gamma_init=args.gamma_init, n_cyclic=args.n_cyclic,
+            cyclic_charge=name == "ham_charge",
         )
     elif name in ("ham_learned", "ham_geometry"):
         core = HamiltonianCharModel(
@@ -341,7 +360,8 @@ def run(task: str, model_name: str, seed: int, args) -> Result:
     for step in range(1, args.steps + 1):
         length = args.seq_len
         if args.train_len_min:
-            length = int(torch.randint(args.train_len_min, args.seq_len + 1, (1,), generator=gen))
+            top = args.train_len_max or args.seq_len
+            length = int(torch.randint(args.train_len_min, top + 1, (1,), generator=gen))
         x, y, mask = make(args.batch_size, length, gen)
         loss, _ = masked_loss_acc(model(x), y, mask)
         opt.zero_grad(set_to_none=True)
@@ -404,7 +424,7 @@ def report(results: list[Result], args) -> str:
             f"\n## Run steps={args.steps} T={args.seq_len} hidden={args.hidden_dim} "
             f"substeps={args.substeps} dt={args.dt} seeds={list(args.seeds)} "
             f"lstm_forget_bias={args.lstm_forget_bias}"
-            + (f" train_len={args.train_len_min}-{args.seq_len}" if args.train_len_min else "") + "\n"
+            + (f" train_len={args.train_len_min}-{args.train_len_max or args.seq_len}" if args.train_len_min else "") + "\n"
         ),
         ("| task | model | accuracy | params | learned γ median (90th pct) "
         "| geometry γ / stiffness λ | wall (s) |"),
@@ -480,7 +500,7 @@ def _float_or_none(text: str):
 
 MODELS = (
     "lstm", "transformer", "ham_conservative", "ham_learned", "ham_geometry",
-    "ham_cyclic", "ham_cyclic_learned", "particles", "particles_dense",
+    "ham_cyclic", "ham_cyclic_learned", "ham_charge", "particles", "particles_dense",
 )
 # The particle models cost O(T³) per sequence (tens of minutes per run at
 # T = 40 on CPU), so they are opt-in via --models.
@@ -514,6 +534,8 @@ def main() -> None:
                         help="cyclic (symmetry-protected) coordinates in ham_cyclic*")
     parser.add_argument("--train-len-min", type=int, default=0,
                         help="if > 0, draw each training batch's length from [this, --seq-len]")
+    parser.add_argument("--train-len-max", type=int, default=0,
+                        help="upper end of the training-length range (default: --seq-len)")
     parser.add_argument("--eval-every", type=int, default=0,
                         help="check a fixed validation set every N steps and stop at --target (0 = off)")
     parser.add_argument("--target", type=float, default=0.9)
